@@ -357,7 +357,7 @@ async def process_file_stream(
             ml_result = None
             
             async for sse_event in sse_registry.execute_service_stream(
-                service_name="ml",
+                service_name="ml.execute",
                 params={
                     "data": {
                         "name": file_name_without_ext,
