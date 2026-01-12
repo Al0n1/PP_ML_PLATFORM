@@ -2,8 +2,8 @@
 Роутер для обработки файлов через S3 и ML сервисы.
 
 Логика работы:
-1. Получаем download_url (ссылка на файл в S3)
-2. Скачиваем файл из S3 локально
+1. Получаем download_url (ссылка на файл в S3, может быть presigned URL)
+2. Скачиваем файл локально (по HTTP если presigned URL, или через S3 API)
 3. Обрабатываем через ML сервис
 4. Загружаем результат обратно на S3
 5. Возвращаем ссылку на скачивание
@@ -14,9 +14,11 @@ import json
 import asyncio
 import logging
 import shutil
-from urllib.parse import urlparse
-from typing import Optional
+from urllib.parse import urlparse, parse_qs
+from typing import Optional, Tuple
+from pathlib import Path
 
+import httpx
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -104,6 +106,81 @@ def is_error_event(sse_event: str) -> bool:
     return 'event: error' in sse_event
 
 
+def is_presigned_url(url: str) -> bool:
+    """
+    Проверяет, является ли URL presigned URL (содержит параметры подписи AWS/S3).
+    
+    Presigned URL содержит параметры:
+    - X-Amz-Signature - подпись запроса
+    - X-Amz-Credential - учетные данные
+    - X-Amz-Algorithm - алгоритм подписи
+    
+    :param url: URL для проверки
+    :return: True если это presigned URL
+    """
+    try:
+        parsed = urlparse(url)
+        query_params = parse_qs(parsed.query)
+        
+        # Проверяем наличие характерных параметров AWS подписи
+        signature_params = ['X-Amz-Signature', 'X-Amz-Credential', 'X-Amz-Algorithm']
+        return any(param in query_params for param in signature_params)
+    except Exception:
+        return False
+
+
+async def download_file_from_url(
+    url: str, 
+    dest_dir: str,
+    formatter: SSEEventFormatter
+) -> Tuple[Optional[str], int]:
+    """
+    Скачивает файл напрямую по HTTP URL (presigned URL).
+    
+    :param url: URL для скачивания (presigned URL)
+    :param dest_dir: Директория для сохранения файла
+    :param formatter: SSE форматтер для отправки сообщений о прогрессе
+    :return: Tuple (путь к файлу, размер файла) или (None, 0) при ошибке
+    :yields: SSE события с прогрессом
+    """
+    # Создаем директорию если не существует
+    Path(dest_dir).mkdir(parents=True, exist_ok=True)
+    
+    # Извлекаем имя файла из URL
+    filename = extract_object_key_from_url(url)
+    if not filename:
+        filename = "downloaded_file"
+    
+    file_path = os.path.join(dest_dir, filename)
+    
+    logger.info(f"Starting HTTP download: {url[:100]}... -> {file_path}")
+    
+    timeout = httpx.Timeout(
+        connect=30.0,
+        read=300.0,  # 5 минут на чтение
+        write=30.0,
+        pool=30.0
+    )
+    
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        async with client.stream('GET', url) as response:
+            response.raise_for_status()
+            
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded_size = 0
+            
+            logger.info(f"HTTP response: status={response.status_code}, content-length={total_size}")
+            
+            with open(file_path, 'wb') as f:
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded_size += len(chunk)
+            
+            logger.info(f"HTTP download complete: {file_path} ({downloaded_size} bytes)")
+            
+            return file_path, downloaded_size
+
+
 @router.post("/stream")
 async def process_file_stream(
     request_body: FileProcessRequest
@@ -151,38 +228,110 @@ async def process_file_stream(
             
             logger.info(f"Extracted object_key: {object_key}")
             
-            # === ЭТАП 2: Скачивание файла из S3 ===
-            logger.info(f"Starting S3 download for: {object_key}")
+            # === ЭТАП 2: Скачивание файла ===
+            # Проверяем, является ли URL presigned (с подписью) или обычный S3 URL
+            use_http_download = is_presigned_url(download_url)
             
-            s3_download_result = None
-            
-            async for sse_event in sse_registry.execute_service_stream(
-                service_name="ya_s3",
-                params={
-                    "data": {
-                        "operation": "download",
-                        "object_key": object_key
-                    }
+            if use_http_download:
+                # === Скачивание по HTTP (presigned URL) ===
+                logger.info(f"Detected presigned URL, using HTTP download for: {object_key}")
+                
+                # Отправляем SSE прогресс о начале скачивания
+                progress_msg = {
+                    "progress": 5,
+                    "stage": "downloading",
+                    "status": "in_progress",
+                    "message": "Скачивание файла по presigned URL..."
                 }
-            ):
-                # Проверяем на ошибку
-                if is_error_event(sse_event):
-                    yield sse_event
+                yield formatter.format_event(progress_msg)
+                
+                try:
+                    # Используем временную директорию из ml_settings
+                    temp_dir = os.getenv("TEMP_DIR", "var/temp")
+                    downloaded_file_path, file_size = await download_file_from_url(
+                        url=download_url,
+                        dest_dir=temp_dir,
+                        formatter=formatter
+                    )
+                    
+                    if not downloaded_file_path:
+                        raise Exception("Не удалось скачать файл")
+                    
+                    logger.info(f"HTTP download complete: {downloaded_file_path} ({file_size} bytes)")
+                    
+                    # Отправляем SSE прогресс о завершении скачивания
+                    progress_msg = {
+                        "progress": 15,
+                        "stage": "downloading",
+                        "status": "completed",
+                        "message": f"Файл скачан: {file_size} байт"
+                    }
+                    yield formatter.format_event(progress_msg)
+                    
+                except httpx.HTTPStatusError as e:
+                    logger.error(f"HTTP download failed with status {e.response.status_code}: {e}")
+                    error_msg = {
+                        "progress": -1,
+                        "stage": "error",
+                        "status": "error",
+                        "error": {
+                            "code": "HTTP_DOWNLOAD_FAILED",
+                            "message": f"Ошибка скачивания: HTTP {e.response.status_code}",
+                            "stage_failed": "http_download",
+                            "recoverable": True
+                        }
+                    }
+                    yield formatter.format_event(error_msg)
                     return
+                except Exception as e:
+                    logger.error(f"HTTP download failed: {e}", exc_info=True)
+                    error_msg = {
+                        "progress": -1,
+                        "stage": "error",
+                        "status": "error",
+                        "error": {
+                            "code": "HTTP_DOWNLOAD_FAILED",
+                            "message": f"Ошибка скачивания по HTTP: {str(e)}",
+                            "stage_failed": "http_download",
+                            "error_details": str(e),
+                            "recoverable": True
+                        }
+                    }
+                    yield formatter.format_event(error_msg)
+                    return
+            else:
+                # === Скачивание через S3 API (обычный URL без подписи) ===
+                logger.info(f"Using S3 API download for: {object_key}")
                 
-                # Отлавливаем complete для получения download_path
-                if is_complete_event(sse_event):
-                    data = parse_sse_data(sse_event)
-                    if data and 'result' in data:
-                        s3_download_result = data['result']
-                        downloaded_file_path = s3_download_result.get('download_path')
-                        logger.info(f"S3 download complete: {downloaded_file_path}")
-                    # Не отправляем complete событие от download, продолжаем обработку
-                else:
-                    # Проксируем progress события
-                    yield sse_event
+                s3_download_result = None
                 
-                await asyncio.sleep(0)
+                async for sse_event in sse_registry.execute_service_stream(
+                    service_name="ya_s3",
+                    params={
+                        "data": {
+                            "operation": "download",
+                            "object_key": object_key
+                        }
+                    }
+                ):
+                    # Проверяем на ошибку
+                    if is_error_event(sse_event):
+                        yield sse_event
+                        return
+                    
+                    # Отлавливаем complete для получения download_path
+                    if is_complete_event(sse_event):
+                        data = parse_sse_data(sse_event)
+                        if data and 'result' in data:
+                            s3_download_result = data['result']
+                            downloaded_file_path = s3_download_result.get('download_path')
+                            logger.info(f"S3 download complete: {downloaded_file_path}")
+                        # Не отправляем complete событие от download, продолжаем обработку
+                    else:
+                        # Проксируем progress события
+                        yield sse_event
+                    
+                    await asyncio.sleep(0)
             
             if not downloaded_file_path:
                 error_msg = {
@@ -191,8 +340,8 @@ async def process_file_stream(
                     "status": "error",
                     "error": {
                         "code": "DOWNLOAD_FAILED",
-                        "message": "Не удалось скачать файл из S3",
-                        "stage_failed": "s3_download",
+                        "message": "Не удалось скачать файл",
+                        "stage_failed": "download",
                         "recoverable": True
                     }
                 }
