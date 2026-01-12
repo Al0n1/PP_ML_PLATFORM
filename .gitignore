@@ -1,0 +1,13 @@
+.venv/
+venv/
+.env
+var/
+__pycache__/
+local
+docs/dev
+.github/
+.DS_Store
+mdr_*
+data/
+dev/*
+secrets/
