@@ -273,12 +273,12 @@ async def process_file_stream(
                     yield sse_event
                     return
                 
-                # Отлавливаем complete для получения public_url
+                # Отлавливаем complete для получения presigned_url
                 if is_complete_event(sse_event):
                     data = parse_sse_data(sse_event)
                     if data and 'result' in data:
                         s3_upload_result = data['result']
-                        logger.info(f"S3 upload complete: {s3_upload_result.get('public_url')}")
+                        logger.info(f"S3 upload complete: {s3_upload_result.get('presigned_url')}")
                     # Не отправляем complete событие от upload, формируем финальный ответ
                 else:
                     # Проксируем progress события
@@ -302,8 +302,8 @@ async def process_file_stream(
                 return
             
             # === ЭТАП 5: Формируем финальное событие с download_url ===
-            # Используем presigned URL (download_url) вместо public_url для приватных бакетов
-            result_download_url = s3_upload_result.get('download_url') or s3_upload_result.get('public_url')
+            # Используем presigned URL (download_url) вместо presigned_url для приватных бакетов
+            result_download_url = s3_upload_result.get('download_url') or s3_upload_result.get('presigned_url')
             
             final_result = {
                 "progress": 100,
@@ -319,7 +319,7 @@ async def process_file_stream(
             }
             
             yield formatter.format_event(final_result)
-            logger.info(f"Processing completed successfully. Download URL: {s3_upload_result.get('public_url')}")
+            logger.info(f"Processing completed successfully. Download URL: {s3_upload_result.get('presigned_url')}")
             
         except Exception as e:
             logger.error(f"Critical error in SSE processing: {e}", exc_info=True)
