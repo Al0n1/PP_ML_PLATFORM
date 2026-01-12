@@ -302,15 +302,19 @@ async def process_file_stream(
                 return
             
             # === ЭТАП 5: Формируем финальное событие с download_url ===
+            # Используем presigned URL (download_url) вместо public_url для приватных бакетов
+            result_download_url = s3_upload_result.get('download_url') or s3_upload_result.get('public_url')
+            
             final_result = {
                 "progress": 100,
                 "stage": "complete",
                 "status": "success",
                 "result": {
-                    "download_url": s3_upload_result.get('public_url'),
+                    "download_url": result_download_url,
                     "object_key": s3_upload_result.get('object_key'),
                     "size": s3_upload_result.get('size'),
-                    "original_file": object_key
+                    "original_file": object_key,
+                    "url_expires_in_hours": s3_upload_result.get('url_expires_in_hours')
                 }
             }
             
