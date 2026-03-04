@@ -32,7 +32,6 @@ class Settings(BaseSettings):
     YA_S3_BUCKET_NAME: str = "test-bucket"  # Имя бакета в Object Storage
     YA_S3_ENDPOINT_URL: str = "https://storage.yandexcloud.net"  # S3 endpoint URL
     YA_S3_REGION_NAME: str = "ru-central1"  # Регион Yandex Cloud
-    YA_S3_REGION_NAME: str = "ru-central1"  # Регион Yandex Cloud
     
     # Настройки загрузки файлов
     YA_S3_MULTIPART_THRESHOLD_MB: int = 5  # Размер файла в МБ для переключения на multipart загрузку
@@ -50,9 +49,6 @@ class Settings(BaseSettings):
     YA_S3_PUBLIC_URL_TEMPLATE: str = "https://storage.yandexcloud.net/{bucket}/{key}"  # Шаблон публичного URL
     YA_S3_SIGNED_URL_EXPIRATION_HOURS: int = 24  # Время жизни подписанного URL в часах
     YA_S3_ENABLE_VERSIONING: bool = False  # Использовать версионирование объектов
-    
-    # Настройки RPC
-    RPC_ENABLED: bool = True  # Включить регистрацию в JSON-RPC диспетчере
     
     class Config:
         env_file = ".env"

@@ -1,7 +1,5 @@
 """
-Универсальный форматтер для преобразования сообщений BaseService в SSE события.
-
-Поддерживает автоматическое определение типа события по структуре сообщения.
+Universal formatter for converting internal message dictionaries into SSE events.
 """
 
 import json
@@ -13,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 class SSEEventFormatter:
     """
-    Форматтер для преобразования dict-сообщений от BaseService в SSE события.
+    Formatter for converting internal message dictionaries into SSE events.
     
     Автоматически определяет тип события на основе структуры сообщения:
     - status="success" + progress=100 → event: complete
@@ -26,7 +24,7 @@ class SSEEventFormatter:
         """
         Преобразует dict-сообщение в SSE событие.
         
-        :param message: Сообщение от BaseService (create_progress_message, etc.)
+        :param message: Internal message dictionary.
         :return: Отформатированная SSE строка с двойным \n\n
         """
         event_type = SSEEventFormatter._detect_event_type(message)
@@ -54,7 +52,7 @@ class SSEEventFormatter:
         """
         Автоматически определяет тип SSE события по структуре сообщения.
         
-        :param message: Сообщение от BaseService
+        :param message: Internal message dictionary
         :return: Тип события ("progress", "complete", "error")
         """
         status = message.get("status", "processing")

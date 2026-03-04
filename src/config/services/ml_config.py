@@ -6,15 +6,11 @@ load_dotenv()
 
 
 class Settings(BaseSettings):
-    # ✅ правильная конфигурация для Pydantic v2
     model_config = SettingsConfigDict(
         env_file=".env",
         case_sensitive=True,
         extra="ignore",
     )
-
-    # ===== Runtime flags =====
-    RPC_ENABLED: bool = True
 
     # ===== Paths =====
     TEMP_DIR: str = "var/temp"

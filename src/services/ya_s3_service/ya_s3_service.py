@@ -1,188 +1,162 @@
 """
-Сервис для работы с Yandex Object Storage через S3-совместимый API (aioboto3).
-
-Поддерживаемые операции:
-- upload: Загрузка файлов (с автоматическим переключением на multipart для больших файлов)
-- download: Скачивание файлов
-- delete: Удаление файлов из хранилища
-- list: Список файлов в бакете
-
-Автоматически регистрируется в RPC диспетчере как ya_s3.execute
+Service for working with Yandex Object Storage via the S3-compatible API.
 """
 
+from __future__ import annotations
+
+import asyncio
+import hashlib
 import logging
 import os
-import asyncio
-from pathlib import Path
-from typing import AsyncIterator, Optional, Dict, Any
 from datetime import datetime, timezone
-import hashlib
+from pathlib import Path
+from typing import AsyncIterator, Optional
 
 import aioboto3
-from botocore.exceptions import ClientError, BotoCoreError
 from botocore.config import Config as BotoConfig
+from botocore.exceptions import BotoCoreError, ClientError
 
-from src.services.base_service import BaseService
 from src.config.services.ya_s3_config import settings
+from src.utils.sse_messages import build_error, build_progress, build_success
 
 logger = logging.getLogger(__name__)
 
+STAGE_PROGRESS = {
+    "initializing": 5,
+    "uploading": 70,
+    "downloading": 70,
+    "deleting": 50,
+    "listing": 50,
+}
 
-class YaS3Service(BaseService):
+
+class YaS3Service:
     """
-    Сервис для работы с Yandex Object Storage через S3-совместимый API.
-    
-    Реализует операции загрузки, скачивания и удаления файлов
-    с использованием aioboto3 (async boto3 клиент для S3).
-    
-    Особенности:
-    - Автоматическая multipart загрузка для файлов > YA_S3_MULTIPART_THRESHOLD_MB
-    - Поддержка повторных попыток при сетевых ошибках
-    - SSE прогресс для длительных операций
-    - Проверка целостности файлов (MD5 хеши)
+    Service boundary for Yandex Object Storage.
     """
-    
-    # Маппинг S3 ошибок в понятные сообщения
+
     S3_ERROR_CODES = {
-        "NoSuchBucket": "Бакет не существует",
-        "NoSuchKey": "Файл не найден в хранилище",
-        "AccessDenied": "Доступ запрещен. Проверьте права доступа",
-        "InvalidAccessKeyId": "Неверный Access Key ID",
-        "SignatureDoesNotMatch": "Неверный Secret Access Key",
-        "BucketAlreadyExists": "Бакет с таким именем уже существует",
-        "BucketNotEmpty": "Невозможно удалить непустой бакет",
-        "EntityTooLarge": "Файл слишком большой",
-        "InvalidBucketName": "Неверное имя бакета",
-        "KeyTooLong": "Слишком длинное имя файла",
-        "ServiceUnavailable": "Сервис временно недоступен",
-        "RequestTimeout": "Таймаут запроса"
+        "NoSuchBucket": "Bucket does not exist",
+        "NoSuchKey": "Object not found",
+        "AccessDenied": "Access denied",
+        "InvalidAccessKeyId": "Invalid access key id",
+        "SignatureDoesNotMatch": "Invalid secret access key",
+        "BucketAlreadyExists": "Bucket already exists",
+        "BucketNotEmpty": "Bucket is not empty",
+        "EntityTooLarge": "File is too large",
+        "InvalidBucketName": "Invalid bucket name",
+        "KeyTooLong": "Object key is too long",
+        "ServiceUnavailable": "Service temporarily unavailable",
+        "RequestTimeout": "Request timeout",
     }
-    
+
     def __init__(self):
-        """Инициализация сервиса."""
-        super().__init__()
         self._session: Optional[aioboto3.Session] = None
-        self._boto_config: Optional[BotoConfig] = None
-        
-        # Настройка boto3 конфигурации с повторными попытками
         self._boto_config = BotoConfig(
             region_name=settings.YA_S3_REGION_NAME,
-            signature_version='s3v4',  # AWS Signature Version 4 для Yandex Cloud
-            s3={
-                'addressing_style': 'virtual'  # Виртуальный стиль хостинга (bucket.storage.yandexcloud.net)
-            },
+            signature_version="s3v4",
+            s3={"addressing_style": "virtual"},
             retries={
-                'max_attempts': settings.YA_S3_MAX_RETRIES,
-                'mode': 'adaptive'
+                "max_attempts": settings.YA_S3_MAX_RETRIES,
+                "mode": "adaptive",
             },
             connect_timeout=30,
-            read_timeout=settings.YA_S3_OPERATION_TIMEOUT_SECONDS
+            read_timeout=settings.YA_S3_OPERATION_TIMEOUT_SECONDS,
         )
-        
-        logger.info("YaS3Service initialized with aioboto3")
-    
+        logger.info("YaS3Service initialized")
+
     def _get_session(self) -> aioboto3.Session:
-        """
-        Возвращает aioboto3 сессию для работы с S3.
-        
-        :return: Aioboto3 сессия
-        """
         if self._session is None:
             self._session = aioboto3.Session(
                 aws_access_key_id=settings.YA_S3_ACCESS_KEY_ID,
                 aws_secret_access_key=settings.YA_S3_SECRET_ACCESS_KEY,
-                region_name=settings.YA_S3_REGION_NAME
+                region_name=settings.YA_S3_REGION_NAME,
             )
         return self._session
-    
+
     def _get_s3_client(self):
-        """
-        Создает async S3 клиент (возвращает context manager).
-        
-        :return: Async context manager для S3 клиента
-        """
         session = self._get_session()
         return session.client(
-            's3',
+            "s3",
             endpoint_url=settings.YA_S3_ENDPOINT_URL,
-            config=self._boto_config
+            config=self._boto_config,
         )
-    
+
+    @staticmethod
+    def _success(result: dict | None = None) -> dict:
+        return build_success(result=result)
+
+    @staticmethod
+    def _error(
+        code: str,
+        message: str,
+        stage_failed: str,
+        details: str | None = None,
+        recoverable: bool = True,
+    ) -> dict:
+        return build_error(
+            code=code,
+            message=message,
+            stage_failed=stage_failed,
+            details=details,
+            recoverable=recoverable,
+        )
+
+    def _progress(
+        self,
+        stage: str,
+        *,
+        progress: int | None = None,
+        details: dict | None = None,
+    ) -> dict:
+        return build_progress(
+            progress=progress if progress is not None else STAGE_PROGRESS[stage],
+            stage=stage,
+            details=details,
+        )
+
     def _calculate_md5(self, file_path: Path) -> str:
-        """
-        Вычисляет MD5 хеш файла.
-        
-        :param file_path: Путь к файлу
-        :return: MD5 хеш в hex формате
-        """
         md5_hash = hashlib.md5()
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(4096), b''):
+        with open(file_path, "rb") as file_obj:
+            for chunk in iter(lambda: file_obj.read(4096), b""):
                 md5_hash.update(chunk)
         return md5_hash.hexdigest()
-    
+
     def _handle_s3_error(self, error: Exception, operation: str) -> str:
-        """
-        Обрабатывает ошибки S3 и возвращает понятное сообщение.
-        
-        :param error: Исключение
-        :param operation: Название операции
-        :return: Понятное сообщение об ошибке
-        """
         if isinstance(error, ClientError):
-            error_code = error.response.get('Error', {}).get('Code', 'Unknown')
-            error_message = self.S3_ERROR_CODES.get(error_code, f"Ошибка S3: {error_code}")
-            logger.error(f"S3 ClientError during {operation}: {error_code} - {error_message}")
+            error_code = error.response.get("Error", {}).get("Code", "Unknown")
+            error_message = self.S3_ERROR_CODES.get(error_code, f"S3 error: {error_code}")
+            logger.error("S3 ClientError during %s: %s - %s", operation, error_code, error_message)
             return f"{operation}: {error_message}"
-        elif isinstance(error, BotoCoreError):
-            logger.error(f"BotoCoreError during {operation}: {str(error)}")
-            return f"{operation}: Ошибка соединения с S3"
-        else:
-            logger.error(f"Unexpected error during {operation}: {str(error)}")
-            return f"{operation}: {str(error)}"
-    
+        if isinstance(error, BotoCoreError):
+            logger.error("BotoCoreError during %s: %s", operation, error)
+            return f"{operation}: S3 connection error"
+        logger.error("Unexpected error during %s: %s", operation, error)
+        return f"{operation}: {error}"
+
     async def execute_stream(self, data: dict) -> AsyncIterator[dict]:
-        """
-        SSE streaming выполнение операции с прогрессом.
-        
-        :param data: Словарь с параметрами операции:
-            {
-                "data": {
-                    "operation": "upload" | "download" | "delete" | "list",
-                    "file_path": str (для upload/download),
-                    "object_key": str (для download/delete),
-                    "prefix": str (для list, опционально)
-                }
-            }
-        :yield: Словари с SSE сообщениями (прогресс, ошибки, результаты)
-        """
-        self._start_tracking()
-        
-        # Извлекаем данные операции
         operation_data = data.get("data", {})
         operation = operation_data.get("operation", "").lower()
-        
-        logger.info(f"YaS3Service.execute_stream: operation={operation}, data={operation_data}")
-        
-        # Валидация операции
+
+        logger.info("YaS3Service.execute_stream: operation=%s, data=%s", operation, operation_data)
+
         if not operation:
-            yield self.create_error_message(
-                error_code="OPERATION_MISSING",
-                error_message="Не указана операция (operation)",
-                stage_failed="validation"
+            yield self._error(
+                code="OPERATION_MISSING",
+                message="Operation is required",
+                stage_failed="validation",
             )
             return
-        
-        if operation not in ["upload", "download", "delete", "list"]:
-            yield self.create_error_message(
-                error_code="OPERATION_UNKNOWN",
-                error_message=f"Неизвестная операция: {operation}",
-                stage_failed="validation"
+
+        if operation not in {"upload", "download", "delete", "list"}:
+            yield self._error(
+                code="OPERATION_UNKNOWN",
+                message=f"Unknown operation: {operation}",
+                stage_failed="validation",
             )
             return
-        
+
         try:
-            # Маршрутизация на конкретный метод
             if operation == "upload":
                 async for message in self._execute_upload_stream(operation_data):
                     yield message
@@ -192,429 +166,322 @@ class YaS3Service(BaseService):
             elif operation == "delete":
                 async for message in self._execute_delete_stream(operation_data):
                     yield message
-            elif operation == "list":
+            else:
                 async for message in self._execute_list_stream(operation_data):
                     yield message
-                    
-        except Exception as e:
-            error_msg = self._handle_s3_error(e, operation)
-            logger.exception(f"Error in execute_stream for operation {operation}")
-            yield self.create_error_message(
-                error_code="SERVICE_ERROR",
-                error_message=error_msg,
+        except Exception as exc:
+            error_message = self._handle_s3_error(exc, operation)
+            logger.exception("Error in execute_stream for operation %s", operation)
+            yield self._error(
+                code="SERVICE_ERROR",
+                message=error_message,
                 stage_failed=operation,
-                error_details=str(e)
+                details=str(exc),
             )
-    
+
     async def _execute_upload_stream(self, data: dict) -> AsyncIterator[dict]:
-        """
-        Загружает файл в S3 с прогрессом.
-        
-        :param data: Параметры загрузки (file_path, object_key опционально)
-        :yield: SSE сообщения с прогрессом
-        """
         file_path_str = data.get("file_path")
         object_key = data.get("object_key")
-        
+
         if not file_path_str:
-            yield self.create_error_message(
-                error_code="FILE_PATH_MISSING",
-                error_message="Не указан путь к файлу (file_path)",
-                stage_failed="validation"
+            yield self._error(
+                code="FILE_PATH_MISSING",
+                message="file_path is required",
+                stage_failed="validation",
             )
             return
-        
+
         file_path = Path(file_path_str)
         if not file_path.exists():
-            yield self.create_error_message(
-                error_code="FILE_NOT_FOUND",
-                error_message=f"Файл не найден: {file_path}",
-                stage_failed="validation"
+            yield self._error(
+                code="FILE_NOT_FOUND",
+                message=f"File not found: {file_path}",
+                stage_failed="validation",
             )
             return
-        
-        # Если не указан object_key, используем имя файла
+
         if not object_key:
             object_key = file_path.name
-        
+
         file_size = file_path.stat().st_size
-        
-        # Начинаем первую стадию
-        self.next_stage()
-        yield self.get_current_stage_message()
-        
-        logger.info(f"Starting upload: {file_path} -> s3://{settings.YA_S3_BUCKET_NAME}/{object_key} ({file_size} bytes)")
-        
+
+        yield self._progress("initializing")
+        logger.info("Starting upload: %s -> s3://%s/%s", file_path, settings.YA_S3_BUCKET_NAME, object_key)
+
         try:
-            # Вычисляем MD5 для проверки целостности
             md5_hash = self._calculate_md5(file_path)
-            logger.info(f"File MD5: {md5_hash}")
-            
-            # Переходим к стадии загрузки
-            self.next_stage()
-            
-            # Выбираем метод загрузки: simple или multipart
+
             if file_size > settings.multipart_threshold_bytes:
-                logger.info(f"File size {file_size} exceeds threshold, using multipart upload")
                 async for message in self._upload_file_multipart(file_path, object_key, file_size):
                     yield message
             else:
-                logger.info(f"File size {file_size} below threshold, using simple upload")
-                async for message in self._upload_file_simple(file_path, object_key, file_size):
+                async for message in self._upload_file_simple(file_path, object_key):
                     yield message
-            
-            # Завершаем успешно - генерируем presigned URL для скачивания
+
             presigned_url = await self.generate_presigned_url(object_key)
             public_url = settings.get_public_url(object_key)
-            
+
             result = {
                 "object_key": object_key,
                 "bucket": settings.YA_S3_BUCKET_NAME,
                 "size": file_size,
                 "md5": md5_hash,
-                "public_url": public_url,  # Публичный URL (работает только для публичных бакетов)
-                "download_url": presigned_url,  # Presigned URL для скачивания (работает всегда)
+                "public_url": public_url,
+                "download_url": presigned_url,
                 "url_expires_in_hours": settings.YA_S3_SIGNED_URL_EXPIRATION_HOURS,
-                "uploaded_at": datetime.now(timezone.utc).isoformat()
+                "uploaded_at": datetime.now(timezone.utc).isoformat(),
             }
-            
-            yield self.create_success_message(result=result)
-            logger.info(f"Upload completed successfully: {object_key}")
-            
-        except Exception as e:
-            error_msg = self._handle_s3_error(e, "upload")
-            logger.exception(f"Upload failed for {file_path}")
-            yield self.create_error_message(
-                error_code="UPLOAD_FAILED",
-                error_message=error_msg,
+
+            yield self._success(result=result)
+        except Exception as exc:
+            error_message = self._handle_s3_error(exc, "upload")
+            logger.exception("Upload failed for %s", file_path)
+            yield self._error(
+                code="UPLOAD_FAILED",
+                message=error_message,
                 stage_failed="uploading",
-                error_details=str(e)
+                details=str(exc),
             )
-    
-    async def _upload_file_simple(self, file_path: Path, object_key: str, file_size: int) -> AsyncIterator[dict]:
-        """
-        Простая загрузка файла в S3 (для файлов < threshold).
-        
-        :param file_path: Путь к файлу
-        :param object_key: Ключ объекта в S3
-        :param file_size: Размер файла
-        :yield: SSE сообщения с прогрессом
-        """
+
+    async def _upload_file_simple(self, file_path: Path, object_key: str) -> AsyncIterator[dict]:
         async with self._get_s3_client() as s3_client:
-            with open(file_path, 'rb') as file_obj:
+            with open(file_path, "rb") as file_obj:
                 await s3_client.put_object(
                     Bucket=settings.YA_S3_BUCKET_NAME,
                     Key=object_key,
-                    Body=file_obj
+                    Body=file_obj,
                 )
-                
-                # Отправляем прогресс
-                yield self.get_current_stage_message()
-    
+
+        yield self._progress("uploading", progress=95)
+
     async def _upload_file_multipart(self, file_path: Path, object_key: str, file_size: int) -> AsyncIterator[dict]:
-        """
-        Multipart загрузка файла в S3 (для больших файлов).
-        
-        :param file_path: Путь к файлу
-        :param object_key: Ключ объекта в S3
-        :param file_size: Размер файла
-        :yield: SSE сообщения с прогрессом
-        """
         chunk_size = settings.multipart_chunk_size_bytes
         total_parts = (file_size + chunk_size - 1) // chunk_size
-        
-        # Устанавливаем количество субшагов для прогресса
-        self.next_stage(total_substeps=total_parts)
-        
+
         async with self._get_s3_client() as s3_client:
-            # Инициируем multipart upload
             response = await s3_client.create_multipart_upload(
                 Bucket=settings.YA_S3_BUCKET_NAME,
-                Key=object_key
+                Key=object_key,
             )
-            upload_id = response['UploadId']
-            logger.info(f"Multipart upload initiated: upload_id={upload_id}, total_parts={total_parts}")
-            
+            upload_id = response["UploadId"]
+            logger.info("Multipart upload initiated: upload_id=%s, total_parts=%s", upload_id, total_parts)
+
             try:
                 parts = []
-                
-                with open(file_path, 'rb') as file_obj:
+                with open(file_path, "rb") as file_obj:
                     for part_number in range(1, total_parts + 1):
-                        # Читаем часть файла
                         chunk = file_obj.read(chunk_size)
-                        
-                        # Загружаем часть
                         part_response = await s3_client.upload_part(
                             Bucket=settings.YA_S3_BUCKET_NAME,
                             Key=object_key,
                             PartNumber=part_number,
                             UploadId=upload_id,
-                            Body=chunk
+                            Body=chunk,
                         )
-                        
-                        parts.append({
-                            'PartNumber': part_number,
-                            'ETag': part_response['ETag']
-                        })
-                        
-                        # Обновляем прогресс
-                        self.increment_substep()
-                        yield self.get_current_stage_message(include_eta=True)
-                        
-                        logger.debug(f"Uploaded part {part_number}/{total_parts}")
-                
-                # Завершаем multipart upload
+                        parts.append(
+                            {
+                                "PartNumber": part_number,
+                                "ETag": part_response["ETag"],
+                            }
+                        )
+
+                        progress = min(95, 70 + int((part_number / total_parts) * 25))
+                        yield self._progress(
+                            "uploading",
+                            progress=progress,
+                            details={
+                                "current_step": part_number,
+                                "total_steps": total_parts,
+                            },
+                        )
+
                 await s3_client.complete_multipart_upload(
                     Bucket=settings.YA_S3_BUCKET_NAME,
                     Key=object_key,
                     UploadId=upload_id,
-                    MultipartUpload={'Parts': parts}
+                    MultipartUpload={"Parts": parts},
                 )
-                
-                logger.info(f"Multipart upload completed: {object_key}")
-                
-            except Exception as e:
-                # При ошибке отменяем multipart upload
-                logger.error(f"Multipart upload failed, aborting: {e}")
+                logger.info("Multipart upload completed: %s", object_key)
+            except Exception:
+                logger.exception("Multipart upload failed, aborting")
                 try:
                     await s3_client.abort_multipart_upload(
                         Bucket=settings.YA_S3_BUCKET_NAME,
                         Key=object_key,
-                        UploadId=upload_id
+                        UploadId=upload_id,
                     )
-                except Exception as abort_error:
-                    logger.error(f"Failed to abort multipart upload: {abort_error}")
+                except Exception:
+                    logger.exception("Failed to abort multipart upload")
                 raise
-    
+
     async def _execute_download_stream(self, data: dict) -> AsyncIterator[dict]:
-        """
-        Скачивает файл из S3 с прогрессом.
-        
-        :param data: Параметры скачивания (object_key, download_path опционально)
-        :yield: SSE сообщения с прогрессом
-        """
         object_key = data.get("object_key")
         download_path_str = data.get("download_path")
-        
+
         if not object_key:
-            yield self.create_error_message(
-                error_code="OBJECT_KEY_MISSING",
-                error_message="Не указан ключ объекта (object_key)",
-                stage_failed="validation"
+            yield self._error(
+                code="OBJECT_KEY_MISSING",
+                message="object_key is required",
+                stage_failed="validation",
             )
             return
-        
-        # Если не указан путь для скачивания, используем temp директорию
-        if not download_path_str:
+
+        if download_path_str:
+            download_path = Path(download_path_str)
+        else:
             temp_dir = Path(os.getenv("TEMP_DIR", "var/temp"))
             temp_dir.mkdir(parents=True, exist_ok=True)
             download_path = temp_dir / Path(object_key).name
-        else:
-            download_path = Path(download_path_str)
-        
-        # Начинаем первую стадию
-        self.next_stage()
-        yield self.get_current_stage_message()
-        
-        logger.info(f"Starting download: s3://{settings.YA_S3_BUCKET_NAME}/{object_key} -> {download_path}")
-        
+
+        yield self._progress("initializing")
+        logger.info("Starting download: s3://%s/%s -> %s", settings.YA_S3_BUCKET_NAME, object_key, download_path)
+
         try:
             async with self._get_s3_client() as s3_client:
-                # Получаем метаданные объекта
                 head_response = await s3_client.head_object(
                     Bucket=settings.YA_S3_BUCKET_NAME,
-                    Key=object_key
+                    Key=object_key,
                 )
-                file_size = head_response['ContentLength']
-                
-                logger.info(f"Object size: {file_size} bytes")
-                
-                # Переходим к стадии скачивания
-                self.next_stage()
-                yield self.get_current_stage_message()
-                
-                # Скачиваем файл
+                file_size = head_response["ContentLength"]
+
                 download_path.parent.mkdir(parents=True, exist_ok=True)
-                
+                yield self._progress("downloading")
+
                 await s3_client.download_file(
                     Bucket=settings.YA_S3_BUCKET_NAME,
                     Key=object_key,
-                    Filename=str(download_path)
+                    Filename=str(download_path),
                 )
-                
-                logger.info(f"Download completed: {download_path}")
-                
-                # Завершаем успешно
-                result = {
-                    "object_key": object_key,
-                    "download_path": str(download_path),
-                    "size": file_size,
-                    "downloaded_at": datetime.now(timezone.utc).isoformat()
-                }
-                
-                yield self.create_success_message(result=result)
-                
-        except Exception as e:
-            error_msg = self._handle_s3_error(e, "download")
-            logger.exception(f"Download failed for {object_key}")
-            yield self.create_error_message(
-                error_code="DOWNLOAD_FAILED",
-                error_message=error_msg,
+
+            result = {
+                "object_key": object_key,
+                "download_path": str(download_path),
+                "size": file_size,
+                "downloaded_at": datetime.now(timezone.utc).isoformat(),
+            }
+            yield self._success(result=result)
+        except Exception as exc:
+            error_message = self._handle_s3_error(exc, "download")
+            logger.exception("Download failed for %s", object_key)
+            yield self._error(
+                code="DOWNLOAD_FAILED",
+                message=error_message,
                 stage_failed="downloading",
-                error_details=str(e)
+                details=str(exc),
             )
-    
+
     async def _execute_delete_stream(self, data: dict) -> AsyncIterator[dict]:
-        """
-        Удаляет файл из S3.
-        
-        :param data: Параметры удаления (object_key)
-        :yield: SSE сообщения с прогрессом
-        """
         object_key = data.get("object_key")
-        
         if not object_key:
-            yield self.create_error_message(
-                error_code="OBJECT_KEY_MISSING",
-                error_message="Не указан ключ объекта (object_key)",
-                stage_failed="validation"
+            yield self._error(
+                code="OBJECT_KEY_MISSING",
+                message="object_key is required",
+                stage_failed="validation",
             )
             return
-        
-        # Начинаем стадию удаления
-        self.next_stage()
-        yield self.get_current_stage_message()
-        
-        logger.info(f"Deleting object: s3://{settings.YA_S3_BUCKET_NAME}/{object_key}")
-        
+
+        yield self._progress("deleting")
+        logger.info("Deleting object: s3://%s/%s", settings.YA_S3_BUCKET_NAME, object_key)
+
         try:
             async with self._get_s3_client() as s3_client:
                 await s3_client.delete_object(
                     Bucket=settings.YA_S3_BUCKET_NAME,
-                    Key=object_key
+                    Key=object_key,
                 )
-                
-                logger.info(f"Object deleted: {object_key}")
-                
-                result = {
-                    "object_key": object_key,
-                    "deleted_at": datetime.now(timezone.utc).isoformat()
-                }
-                
-                yield self.create_success_message(result=result)
-                
-        except Exception as e:
-            error_msg = self._handle_s3_error(e, "delete")
-            logger.exception(f"Delete failed for {object_key}")
-            yield self.create_error_message(
-                error_code="DELETE_FAILED",
-                error_message=error_msg,
+
+            result = {
+                "object_key": object_key,
+                "deleted_at": datetime.now(timezone.utc).isoformat(),
+            }
+            yield self._success(result=result)
+        except Exception as exc:
+            error_message = self._handle_s3_error(exc, "delete")
+            logger.exception("Delete failed for %s", object_key)
+            yield self._error(
+                code="DELETE_FAILED",
+                message=error_message,
                 stage_failed="deleting",
-                error_details=str(e)
+                details=str(exc),
             )
-    
-    async def generate_presigned_url(self, object_key: str, expiration_hours: Optional[int] = None) -> str:
-        """
-        Генерирует presigned URL для скачивания объекта.
-        
-        :param object_key: Ключ объекта в S3
-        :param expiration_hours: Время жизни URL в часах (по умолчанию из настроек)
-        :return: Подписанный URL
-        """
-        if expiration_hours is None:
-            expiration_hours = settings.YA_S3_SIGNED_URL_EXPIRATION_HOURS
-        
-        expiration_seconds = expiration_hours * 3600
-        
-        async with self._get_s3_client() as s3_client:
-            presigned_url = await s3_client.generate_presigned_url(
-                'get_object',
-                Params={
-                    'Bucket': settings.YA_S3_BUCKET_NAME,
-                    'Key': object_key
-                },
-                ExpiresIn=expiration_seconds
-            )
-            return presigned_url
-    
+
     async def _execute_list_stream(self, data: dict) -> AsyncIterator[dict]:
-        """
-        Получает список файлов из S3.
-        
-        :param data: Параметры (prefix опционально)
-        :yield: SSE сообщения с прогрессом
-        """
         prefix = data.get("prefix", "")
-        
-        # Начинаем стадию получения списка
-        self.next_stage()
-        yield self.get_current_stage_message()
-        
-        logger.info(f"Listing objects in bucket {settings.YA_S3_BUCKET_NAME} with prefix '{prefix}'")
-        
+
+        yield self._progress("listing")
+        logger.info("Listing objects in bucket %s with prefix '%s'", settings.YA_S3_BUCKET_NAME, prefix)
+
         try:
             async with self._get_s3_client() as s3_client:
-                paginator = s3_client.get_paginator('list_objects_v2')
-                
+                paginator = s3_client.get_paginator("list_objects_v2")
                 objects = []
                 async for page in paginator.paginate(
                     Bucket=settings.YA_S3_BUCKET_NAME,
-                    Prefix=prefix
+                    Prefix=prefix,
                 ):
-                    if 'Contents' in page:
-                        for obj in page['Contents']:
-                            objects.append({
-                                "key": obj['Key'],
-                                "size": obj['Size'],
-                                "last_modified": obj['LastModified'].isoformat(),
-                                "etag": obj['ETag'].strip('"')
-                            })
-                
-                logger.info(f"Found {len(objects)} objects")
-                
-                result = {
-                    "bucket": settings.YA_S3_BUCKET_NAME,
-                    "prefix": prefix,
-                    "count": len(objects),
-                    "objects": objects
-                }
-                
-                yield self.create_success_message(result=result)
-                
-        except Exception as e:
-            error_msg = self._handle_s3_error(e, "list")
-            logger.exception(f"List failed for prefix '{prefix}'")
-            yield self.create_error_message(
-                error_code="LIST_FAILED",
-                error_message=error_msg,
+                    if "Contents" not in page:
+                        continue
+                    for obj in page["Contents"]:
+                        objects.append(
+                            {
+                                "key": obj["Key"],
+                                "size": obj["Size"],
+                                "last_modified": obj["LastModified"].isoformat(),
+                                "etag": obj["ETag"].strip('"'),
+                            }
+                        )
+
+            result = {
+                "bucket": settings.YA_S3_BUCKET_NAME,
+                "prefix": prefix,
+                "count": len(objects),
+                "objects": objects,
+            }
+            yield self._success(result=result)
+        except Exception as exc:
+            error_message = self._handle_s3_error(exc, "list")
+            logger.exception("List failed for prefix '%s'", prefix)
+            yield self._error(
+                code="LIST_FAILED",
+                message=error_message,
                 stage_failed="listing",
-                error_details=str(e)
+                details=str(exc),
             )
-    
+
+    async def generate_presigned_url(self, object_key: str, expiration_hours: Optional[int] = None) -> str:
+        if expiration_hours is None:
+            expiration_hours = settings.YA_S3_SIGNED_URL_EXPIRATION_HOURS
+
+        expiration_seconds = expiration_hours * 3600
+
+        async with self._get_s3_client() as s3_client:
+            return await s3_client.generate_presigned_url(
+                "get_object",
+                Params={
+                    "Bucket": settings.YA_S3_BUCKET_NAME,
+                    "Key": object_key,
+                },
+                ExpiresIn=expiration_seconds,
+            )
+
     def execute(self, data: dict) -> dict:
-        """
-        Синхронная версия (для RPC backward compatibility).
-        Не рекомендуется для длительных операций - используйте execute_stream.
-        
-        :param data: Параметры операции
-        :return: Результат выполнения
-        """
-        logger.warning("YaS3Service.execute() called - prefer execute_stream() for SSE progress")
-        
-        # Запускаем асинхронную версию синхронно
+        logger.warning("YaS3Service.execute() called - prefer execute_stream()")
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
+
         try:
-            messages = []
+            messages: list[dict] = []
+
             async def collect_messages():
                 async for message in self.execute_stream(data):
                     messages.append(message)
-            
+
             loop.run_until_complete(collect_messages())
-            
-            # Возвращаем последнее сообщение (обычно success или error)
-            return messages[-1] if messages else {"status": "error", "message": "No response"}
-            
+            return messages[-1] if messages else self._error(
+                code="SERVICE_ERROR",
+                message="No response",
+                stage_failed="execution",
+            )
         finally:
             loop.close()

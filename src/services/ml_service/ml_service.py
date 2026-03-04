@@ -2,12 +2,11 @@
 Сервис перевода видео.
 """
 import os
-import asyncio
 import shutil
 import logging
 from typing import AsyncIterator
-from src.services.base_service import BaseService
-from src.config.services.ml_config import settings, Settings
+from src.config.services.ml_config import settings
+from src.utils.sse_messages import build_error, build_progress, build_success
 from . import utils as service_utils
 from . import n_models as models
 from contextlib import contextmanager
@@ -25,8 +24,19 @@ def log_duration(message: str):
 
 logger = logging.getLogger(__name__)
 
+STAGE_PROGRESS = {
+    "copying_file": 5,
+    "splitting_frames": 10,
+    "extracting_audio": 25,
+    "recognizing_speech": 40,
+    "translating_text": 55,
+    "generating_tts": 70,
+    "processing_frames": 85,
+    "assembling_video": 95,
+}
 
-class MLService(BaseService):
+
+class MLService:
     """
     Сервис для обработки видео с применением ML-пайплайна.
 
@@ -53,13 +63,14 @@ class MLService(BaseService):
         Args:
             temp_dir (str): Путь к временной директории для хранения промежуточных данных.
         """
-        super().__init__()
         self.audio_extract_name = 'audio_extract'
         self.audio_translate_name = 'audio_translate'
         self.audio_results_name = 'audio_results'
 
         self.video_ocr_name = 'video_ocr'
         self.video_translate_name = 'video_translate'
+        self.stage_progress = dict(STAGE_PROGRESS)
+        self.stage_order = list(self.stage_progress.keys())
 
         with log_duration("INIT models"):
             self._init_models()
@@ -79,6 +90,29 @@ class MLService(BaseService):
         with log_duration("OCR.__init__"):
             self.ocr = models.OCR(device=settings.OCR_DEVICE)
 
+    def _progress_message(
+        self,
+        stage_id: str,
+        current_step: int | None = None,
+        total_steps: int | None = None,
+    ) -> dict:
+        progress = self.stage_progress[stage_id]
+        details = None
+
+        if current_step is not None and total_steps:
+            current_index = self.stage_order.index(stage_id)
+            next_progress = 100
+            if current_index + 1 < len(self.stage_order):
+                next_progress = self.stage_progress[self.stage_order[current_index + 1]]
+            progress_range = max(0, next_progress - progress)
+            progress = min(99, progress + int((current_step / total_steps) * progress_range))
+            details = {
+                "current_step": current_step,
+                "total_steps": total_steps,
+            }
+
+        return build_progress(progress=progress, stage=stage_id, details=details)
+
     def execute(self, data: dict) -> dict:
         """
         Основной метод для запуска пайплайна обработки видео.
@@ -93,36 +127,29 @@ class MLService(BaseService):
         Returns:
             dict: Результат выполнения с ключами:
                 - "status" (str): Статус выполнения ("success" или "error").
-                - "message" (str): Сообщение о результате.
-                - "echo" (dict): Исходные данные.
-                - "service" (str): Имя сервиса.
+                - "result" (dict): Результат обработки.
         """
         logger.info(f"MLService.execute called with data: {data}")
-        message = data.get("message", "No message provided")
-        path = data.get("path", '')
+        payload = data.get("data", data)
+        path = payload.get("path", "")
+
+        if not path:
+            logger.info("Video path is missing")
+            return {"status": "error", "message": "Path missing"}
 
         filename = os.path.basename(path)
         name = os.path.splitext(filename)[0]
         dir_path = os.path.join(self.temp_dir, name)
         os.makedirs(dir_path, exist_ok=True)
 
-        if not path:
-            logging.info("❌ Путь или имя видео не указано")
-            return {"status": "error", "message": "Path missing"}
-
         # Запуск пайплайна обработки видео
         with log_duration(f'Обработка видео {name}'):
             resp: service_utils.Response = self.__process_video(path, name, dir_path)
 
         if resp.status is False:
-            return {"status": "error", "message": resp.error}
+            return {"status": "error", "message": str(resp.error)}
 
-        result = {
-            "status": "success",
-            "message": f"Data received: {message}",
-            "echo": data,
-            "service": self.getName()
-        }
+        result = {"status": "success", "result": {"output": f"{name}.mp4"}}
 
         logger.info(f"MLService.execute returning: {result}")
         return result
@@ -131,10 +158,18 @@ class MLService(BaseService):
         """
         Streaming версия execute() для SSE.
         """
-        self._start_tracking()
-
+        dir_path = None
         try:
-            path = data['data']["path"]
+            payload = data.get("data", data)
+            path = payload.get("path", "")
+            if not path:
+                yield build_error(
+                    code="ML_PROCESSING_FAILED",
+                    message="Path missing",
+                    stage_failed="validation",
+                )
+                return
+
             filename = os.path.basename(path)
             name = os.path.splitext(filename)[0]
             dir_path = os.path.join(self.temp_dir, name)
@@ -145,17 +180,23 @@ class MLService(BaseService):
                 yield msg
 
             # Успешное завершение
-            yield self.create_success_message(
+            yield build_success(
                 result={"output": f"{name}.mp4"}
             )
 
         except Exception as e:
             logger.exception("❌ Ошибка в execute_stream")
-            yield self.create_error_message(
-                error_code="ML_PROCESSING_FAILED",
-                error_message=str(e),
-                stage_failed=self._current_stage_id or "unknown"
+            yield build_error(
+                code="ML_PROCESSING_FAILED",
+                message=str(e),
+                stage_failed="ml_processing",
             )
+        finally:
+            if dir_path and os.path.isdir(dir_path):
+                try:
+                    shutil.rmtree(dir_path)
+                except Exception:
+                    logger.warning("Failed to cleanup ML workspace: %s", dir_path, exc_info=True)
 
     async def __process_video_stream(self, path: str, name: str, result_dir: str):
         """
@@ -167,14 +208,12 @@ class MLService(BaseService):
         frames_output_dir = os.path.join(base_dir, 'frames')
 
         # === ЭТАП 1: copying_file ===
-        self.next_stage()
-        yield self.get_current_stage_message()
+        yield self._progress_message("copying_file")
 
         shutil.copy(path, base_dir)
 
         # === ЭТАП 2: splitting_frames ===
-        self.next_stage()
-        yield self.get_current_stage_message()
+        yield self._progress_message("splitting_frames")
 
         r = service_utils.extract_frames(path, frames_output_dir)
         if not r.status:
@@ -183,16 +222,14 @@ class MLService(BaseService):
         images = service_utils.get_image_paths(frames_output_dir)
 
         # === ЭТАП 3: extracting_audio ===
-        self.next_stage()
-        yield self.get_current_stage_message()
+        yield self._progress_message("extracting_audio")
 
         r = service_utils.extract_audio(path, extract_audio_path)
         if not r.status:
             raise Exception(r.error)
 
         # === ЭТАП 4: recognizing_speech ===
-        self.next_stage()
-        yield self.get_current_stage_message()
+        yield self._progress_message("recognizing_speech")
 
         r = self.recognizer.transcribe(extract_audio_path)
         if not r.status:
@@ -200,8 +237,7 @@ class MLService(BaseService):
         transcript = r.result
 
         # === ЭТАП 5: translating_text ===
-        self.next_stage()
-        yield self.get_current_stage_message()
+        yield self._progress_message("translating_text")
 
         r = self.translator.translate(transcript)
         if not r.status:
@@ -209,8 +245,7 @@ class MLService(BaseService):
         translation = r.result
 
         # === ЭТАП 6: generating_tts ===
-        self.next_stage()
-        yield self.get_current_stage_message()
+        yield self._progress_message("generating_tts")
 
         wav_path = os.path.join(base_dir, f'{self.audio_translate_name}.wav')
         mp3_path = os.path.join(base_dir, f'{self.audio_translate_name}.mp3')
@@ -219,38 +254,55 @@ class MLService(BaseService):
         if not r.status:
             raise Exception(r.error)
 
-        service_utils.wav_to_mp3(wav_path, mp3_path)
+        r = service_utils.wav_to_mp3(wav_path, mp3_path)
+        if not r.status:
+            raise Exception(r.error)
 
         # === ЭТАП 7: processing_frames (С ПОДЭТАПАМИ) ===
-        self.next_stage(total_substeps=len(images))
+        total_images = len(images)
+        yield self._progress_message("processing_frames")
 
-        ocr_raw = self.ocr.batch(images).result
+        ocr_response = self.ocr.batch(images)
+        if not ocr_response.status:
+            raise Exception(ocr_response.error)
+        ocr_raw = ocr_response.result
         ocr_results = self.ocr.ocr_to_dict(ocr_raw)
-        ocr_results
-        translated = service_utils.translate_ocr_results(
+        translated_response = service_utils.translate_ocr_results(
             self.translator, ocr_results
-        ).result
+        )
+        if not translated_response.status:
+            raise Exception(translated_response.error)
+        translated = translated_response.result
 
         out_dir = os.path.join(base_dir, "frames_translated")
         os.makedirs(out_dir, exist_ok=True)
 
-        for img in images:
-            service_utils.translate_images(
-                [img], translated, output_dir=out_dir, font_path="arial.ttf"
+        for index, img in enumerate(images, start=1):
+            image_response = service_utils.translate_images(
+                [img],
+                translated[index - 1:index],
+                output_dir=out_dir,
+                font_path="arial.ttf",
             )
-            self.increment_substep()
-            yield self.get_current_stage_message(include_eta=True)
+            if not image_response.status:
+                raise Exception(image_response.error)
+            yield self._progress_message(
+                "processing_frames",
+                current_step=index,
+                total_steps=total_images,
+            )
 
         # === ЭТАП 8: assembling_video ===
-        self.next_stage()
-        yield self.get_current_stage_message()
+        yield self._progress_message("assembling_video")
 
-        service_utils.create_video_with_new_audio(
+        r = service_utils.create_video_with_new_audio(
             images_dir=out_dir,
             original_video_path=path,
             new_audio_path=mp3_path,
-            output_video_path=os.path.join(self.temp_dir, f"{name}.mp4")
+            output_video_path=os.path.join(self.temp_dir, f"{name}.mp4"),
         )
+        if not r.status:
+            raise Exception(r.error)
 
 
     def __process_video(self, path: str, name: str, result_dir: str) -> dict:
