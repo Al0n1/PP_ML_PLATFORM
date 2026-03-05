@@ -1,0 +1,38 @@
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3-pip \
+    python3.10-venv \
+    ffmpeg \
+    libgl1 \
+    libglib2.0-0 \
+    libsndfile1 \
+    libgomp1 \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip \
+    && python -m pip install --upgrade pip \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt /app/requirements.txt
+
+RUN grep -vE '^(torch|torchaudio)(\\[.*\\])?([<>=!~].*)?$' /app/requirements.txt > /tmp/requirements.no_torch.txt \
+    && pip install --no-cache-dir -r /tmp/requirements.no_torch.txt \
+    && pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 torch==2.9.0 torchaudio==2.9.0 \
+    && rm -f /tmp/requirements.no_torch.txt
+
+COPY src /app/src
+COPY __init__.py /app/__init__.py
+
+RUN mkdir -p /app/var/temp /app/var/log /app/var/model_cache
+
+EXPOSE 8000
+
+CMD ["python", "-m", "uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
+
