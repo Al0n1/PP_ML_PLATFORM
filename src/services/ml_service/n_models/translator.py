@@ -113,8 +113,9 @@ class UniversalTranslator:
         else:
             raise ValueError(f"Unsupported model: {model_name}")
 
-        # Move model to device
-        self.model.to(self.device)
+        # Move model to device (skip for gemma, which uses device_map="auto")
+        if self.model_type != "gemma":
+            self.model.to(self.device)
         self.model.eval()
 
     def translate(self, text: str, max_new_tokens: int = 256) -> str:
