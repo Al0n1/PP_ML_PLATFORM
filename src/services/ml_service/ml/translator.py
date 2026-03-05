@@ -65,6 +65,7 @@ class UniversalTranslator:
     - rinkorn/marian-finetuned-opus100-en-to-ru (MarianMT)
     - utrobinmv/t5_translate_en_ru_zh_small_1024 (T5)
     - NiuTrans/LMT-60-8B (Causal LM chat model)
+    - google/gemma-3-4b-it (Gemma)
     """
 
     def __init__(self, model_name: str, device: str = None, model_type: str = None):
@@ -100,11 +101,21 @@ class UniversalTranslator:
             )
             self.model = AutoModelForCausalLM.from_pretrained(model_name)
 
+        elif "gemma" in model_name or model_type == 'gemma':
+            self.model_type = "gemma"
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto"
+            )
+
         else:
             raise ValueError(f"Unsupported model: {model_name}")
 
-        # Move model to device
-        self.model.to(self.device)
+        # Move model to device (skip for gemma, which uses device_map="auto")
+        if self.model_type != "gemma":
+            self.model.to(self.device)
         self.model.eval()
 
     def translate(self, text: str, max_new_tokens: int = 256) -> str:
@@ -122,6 +133,36 @@ class UniversalTranslator:
 
                     text = self.tokenizer.decode(output[0], skip_special_tokens=True)
                     return Response(True, None, text)
+                except Exception as e:
+                    return Response(False, e, None)
+
+            # ------------------------------
+            # Gemma (prompt-based CausalLM)
+            # ------------------------------
+            if self.model_type == "gemma":
+                try:
+                    prompt = (
+                        "You are a professional translator.\n\n"
+                        "Translate the following sentence from auto to ru.\n\n"
+                        "IMPORTANT RULES:\n"
+                        "- Return ONLY the translated sentence\n"
+                        "- Do not add explanations\n\n"
+                        f"Sentence:\n{text}\n\n"
+                        "Translated sentence:\n"
+                    )
+                    encoded = self.tokenizer(
+                        prompt, return_tensors="pt"
+                    ).to(self.device)
+
+                    output = self.model.generate(
+                        **encoded,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False
+                    )
+
+                    decoded = self.tokenizer.decode(output[0], skip_special_tokens=True)
+                    result = decoded.split("Translated sentence:")[-1].strip()
+                    return Response(True, None, result)
                 except Exception as e:
                     return Response(False, e, None)
 
@@ -201,6 +242,41 @@ class UniversalTranslator:
                 return Response(False, e, None)
 
         # -----------------------------------------------------
+        # Gemma: prompt-based batch translation
+        # -----------------------------------------------------
+        if self.model_type == "gemma":
+            try:
+                numbered = "\n".join([f"{i+1}. {t}" for i, t in enumerate(texts)])
+                prompt = (
+                    "You are a professional translator.\n\n"
+                    "Translate the following list of sentences from auto to ru.\n\n"
+                    "IMPORTANT RULES:\n"
+                    "- Translate each sentence independently\n"
+                    "- Preserve numbering\n"
+                    "- Return ONLY the translated list\n"
+                    "- Do not add explanations\n\n"
+                    f"Sentences:\n{numbered}\n\n"
+                    "Translated sentences:\n"
+                )
+
+                encoded = self.tokenizer(
+                    prompt, return_tensors="pt"
+                ).to(self.device)
+
+                with torch.no_grad():
+                    output = self.model.generate(
+                        **encoded,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False
+                    )
+
+                decoded = self.tokenizer.decode(output[0], skip_special_tokens=True)
+                result = decoded.split("Translated sentences:")[-1].strip()
+                return Response(True, None, result)
+            except Exception as e:
+                return Response(False, e, None)
+
+        # -----------------------------------------------------
         # Other models: FSMT / Marian / T5
         # -----------------------------------------------------
         try:
@@ -227,6 +303,53 @@ class UniversalTranslator:
             return Response(True, None, results)
         except Exception as e:
             return Response(False, e, None)
+
+
+class GemmaTranslator:
+
+    def __init__(self, model_name="google/gemma-3-4b-it", device=None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto"
+        )
+
+    def _build_prompt(self, texts, source_lang="auto", target_lang="ru"):
+        numbered = "\n".join([f"{i+1}. {t}" for i, t in enumerate(texts)])
+
+        prompt = (
+            "You are a professional translator.\n\n"
+            f"Translate the following list of sentences from {source_lang} to {target_lang}.\n\n"
+            "IMPORTANT RULES:\n"
+            "- Translate each sentence independently\n"
+            "- Preserve numbering\n"
+            "- Return ONLY the translated list\n"
+            "- Do not add explanations\n\n"
+            f"Sentences:\n{numbered}\n\n"
+            "Translated sentences:\n"
+        )
+        return prompt
+
+    def translate(self, texts, source_lang="auto", target_lang="ru", max_new_tokens=512):
+
+        prompt = self._build_prompt(texts, source_lang, target_lang)
+
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.device)
+
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False
+        )
+
+        decoded = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+        result = decoded.split("Translated sentences:")[-1].strip()
+
+        return result
 
 
 from time import perf_counter
