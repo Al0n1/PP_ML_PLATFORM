@@ -3,6 +3,8 @@ HTTP transport layer for file processing.
 """
 
 import logging
+import uuid
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -12,6 +14,12 @@ from src.utils.sse_utils import get_sse_headers
 
 router = APIRouter(prefix='/files', tags=["files"])
 logger = logging.getLogger(__name__)
+
+
+def _sanitize_url(url: str) -> str:
+    parsed = urlparse(url)
+    sanitized = parsed._replace(query="", fragment="")
+    return sanitized.geturl()
 
 
 class FileProcessRequest(BaseModel):
@@ -27,10 +35,25 @@ async def process_file_stream(
     request: Request,
     request_body: FileProcessRequest,
 ) -> StreamingResponse:
-    logger.info("SSE processing started for URL: %s", request_body.download_url)
+    trace_id = uuid.uuid4().hex[:12]
+    client_host = request.client.host if request.client else "-"
+    user_agent = request.headers.get("user-agent", "-")
+    logger.info(
+        "[trace=%s] SSE processing started client=%s user_agent=%s url=%s",
+        trace_id,
+        client_host,
+        user_agent,
+        _sanitize_url(request_body.download_url),
+    )
     pipeline = request.app.state.file_pipeline
+    headers = get_sse_headers()
+    headers["X-Trace-Id"] = trace_id
     return StreamingResponse(
-        pipeline.process_stream(request_body.download_url),
+        pipeline.process_stream(
+            request_body.download_url,
+            trace_id=trace_id,
+            client_host=client_host,
+        ),
         media_type="text/event-stream",
-        headers=get_sse_headers(),
+        headers=headers,
     )

@@ -4,6 +4,7 @@
 import os
 import shutil
 import logging
+from datetime import datetime, timezone
 from typing import AsyncIterator
 from src.config.services.ml_config import settings
 from src.utils.sse_messages import build_error, build_progress, build_success
@@ -11,6 +12,8 @@ from . import utils as service_utils
 from . import n_models as models
 from contextlib import contextmanager
 from time import perf_counter
+
+STREAM_LAG_WARNING_MS = 5_000
 
 @contextmanager
 def log_duration(message: str):
@@ -95,6 +98,7 @@ class MLService:
         stage_id: str,
         current_step: int | None = None,
         total_steps: int | None = None,
+        trace_id: str | None = None,
     ) -> dict:
         progress = self.stage_progress[stage_id]
         details = None
@@ -111,7 +115,10 @@ class MLService:
                 "total_steps": total_steps,
             }
 
-        return build_progress(progress=progress, stage=stage_id, details=details)
+        message = build_progress(progress=progress, stage=stage_id, details=details)
+        if trace_id:
+            self._log_message_created(trace_id, message)
+        return message
 
     def execute(self, data: dict) -> dict:
         """
@@ -159,14 +166,25 @@ class MLService:
         Streaming версия execute() для SSE.
         """
         dir_path = None
+        payload = data.get("data", data)
+        trace_id = self._extract_trace_id(payload)
         try:
-            payload = data.get("data", data)
             path = payload.get("path", "")
             if not path:
-                yield build_error(
+                error_message = build_error(
                     code="ML_PROCESSING_FAILED",
                     message="Path missing",
                     stage_failed="validation",
+                )
+                self._log_message_created(trace_id, error_message)
+                self._log_yield_boundary(trace_id, "before_stream_yield", error_message)
+                yield_started = perf_counter()
+                yield error_message
+                self._log_yield_boundary(
+                    trace_id,
+                    "after_stream_resume",
+                    error_message,
+                    resume_gap_ms=int((perf_counter() - yield_started) * 1000),
                 )
                 return
 
@@ -175,30 +193,71 @@ class MLService:
             dir_path = os.path.join(self.temp_dir, name)
             os.makedirs(dir_path, exist_ok=True)
 
+            logger.info(
+                "[trace=%s] ml.execute_stream.start input_path=%s workspace=%s",
+                trace_id,
+                path,
+                dir_path,
+            )
+
             # Основной streaming-пайплайн
-            async for msg in self.__process_video_stream(path, name, dir_path):
+            async for msg in self.__process_video_stream(path, name, dir_path, trace_id=trace_id):
+                self._log_yield_boundary(trace_id, "before_stream_yield", msg)
+                yield_started = perf_counter()
                 yield msg
+                self._log_yield_boundary(
+                    trace_id,
+                    "after_stream_resume",
+                    msg,
+                    resume_gap_ms=int((perf_counter() - yield_started) * 1000),
+                )
 
             # Успешное завершение
-            yield build_success(
+            success_message = build_success(
                 result={"output": f"{name}.mp4"}
+            )
+            self._log_message_created(trace_id, success_message)
+            self._log_yield_boundary(trace_id, "before_stream_yield", success_message)
+            yield_started = perf_counter()
+            yield success_message
+            self._log_yield_boundary(
+                trace_id,
+                "after_stream_resume",
+                success_message,
+                resume_gap_ms=int((perf_counter() - yield_started) * 1000),
             )
 
         except Exception as e:
-            logger.exception("❌ Ошибка в execute_stream")
-            yield build_error(
+            logger.exception("[trace=%s] ❌ Ошибка в execute_stream", trace_id)
+            error_message = build_error(
                 code="ML_PROCESSING_FAILED",
                 message=str(e),
                 stage_failed="ml_processing",
+            )
+            self._log_message_created(trace_id, error_message)
+            self._log_yield_boundary(trace_id, "before_stream_yield", error_message)
+            yield_started = perf_counter()
+            yield error_message
+            self._log_yield_boundary(
+                trace_id,
+                "after_stream_resume",
+                error_message,
+                resume_gap_ms=int((perf_counter() - yield_started) * 1000),
             )
         finally:
             if dir_path and os.path.isdir(dir_path):
                 try:
                     shutil.rmtree(dir_path)
+                    logger.info("[trace=%s] ml.cleanup.done workspace=%s", trace_id, dir_path)
                 except Exception:
-                    logger.warning("Failed to cleanup ML workspace: %s", dir_path, exc_info=True)
+                    logger.warning(
+                        "[trace=%s] Failed to cleanup ML workspace: %s",
+                        trace_id,
+                        dir_path,
+                        exc_info=True,
+                    )
 
-    async def __process_video_stream(self, path: str, name: str, result_dir: str):
+    async def __process_video_stream(self, path: str, name: str, result_dir: str, trace_id: str):
         """
         Streaming версия обработки видео с прогрессом.
         """
@@ -206,50 +265,87 @@ class MLService:
         base_dir = os.path.join(self.temp_dir, name)
         extract_audio_path = os.path.join(base_dir, f'{self.audio_extract_name}.mp3')
         frames_output_dir = os.path.join(base_dir, 'frames')
+        logger.info(
+            "[trace=%s] ml.pipeline.start base_dir=%s source_path=%s",
+            trace_id,
+            base_dir,
+            path,
+        )
 
         # === ЭТАП 1: copying_file ===
-        yield self._progress_message("copying_file")
-
+        yield self._progress_message("copying_file", trace_id=trace_id)
+        stage_started = perf_counter()
         shutil.copy(path, base_dir)
+        logger.info(
+            "[trace=%s] ml.stage.done stage=copying_file duration_ms=%s destination=%s",
+            trace_id,
+            int((perf_counter() - stage_started) * 1000),
+            base_dir,
+        )
 
         # === ЭТАП 2: splitting_frames ===
-        yield self._progress_message("splitting_frames")
-
+        yield self._progress_message("splitting_frames", trace_id=trace_id)
+        stage_started = perf_counter()
         r = service_utils.extract_frames(path, frames_output_dir)
         if not r.status:
             raise Exception(r.error)
 
         images = service_utils.get_image_paths(frames_output_dir)
+        logger.info(
+            "[trace=%s] ml.stage.done stage=splitting_frames duration_ms=%s frames=%s output_dir=%s",
+            trace_id,
+            int((perf_counter() - stage_started) * 1000),
+            len(images),
+            frames_output_dir,
+        )
 
         # === ЭТАП 3: extracting_audio ===
-        yield self._progress_message("extracting_audio")
-
+        yield self._progress_message("extracting_audio", trace_id=trace_id)
+        stage_started = perf_counter()
         r = service_utils.extract_audio(path, extract_audio_path)
         if not r.status:
             raise Exception(r.error)
+        logger.info(
+            "[trace=%s] ml.stage.done stage=extracting_audio duration_ms=%s audio_path=%s",
+            trace_id,
+            int((perf_counter() - stage_started) * 1000),
+            extract_audio_path,
+        )
 
         # === ЭТАП 4: recognizing_speech ===
-        yield self._progress_message("recognizing_speech")
-
+        yield self._progress_message("recognizing_speech", trace_id=trace_id)
+        stage_started = perf_counter()
         r = self.recognizer.transcribe(extract_audio_path)
         if not r.status:
             raise Exception(r.error)
         transcript = r.result
+        logger.info(
+            "[trace=%s] ml.stage.done stage=recognizing_speech duration_ms=%s transcript_chars=%s",
+            trace_id,
+            int((perf_counter() - stage_started) * 1000),
+            len(transcript or ""),
+        )
 
         # === ЭТАП 5: translating_text ===
-        yield self._progress_message("translating_text")
-
+        yield self._progress_message("translating_text", trace_id=trace_id)
+        stage_started = perf_counter()
         r = self.translator.translate(transcript)
         if not r.status:
             raise Exception(r.error)
         translation = r.result
+        logger.info(
+            "[trace=%s] ml.stage.done stage=translating_text duration_ms=%s translation_chars=%s",
+            trace_id,
+            int((perf_counter() - stage_started) * 1000),
+            len(translation or ""),
+        )
 
         # === ЭТАП 6: generating_tts ===
-        yield self._progress_message("generating_tts")
-
+        yield self._progress_message("generating_tts", trace_id=trace_id)
         wav_path = os.path.join(base_dir, f'{self.audio_translate_name}.wav')
         mp3_path = os.path.join(base_dir, f'{self.audio_translate_name}.mp3')
 
+        stage_started = perf_counter()
         r = self.generator.synthesize(translation, output_path=wav_path)
         if not r.status:
             raise Exception(r.error)
@@ -257,11 +353,20 @@ class MLService:
         r = service_utils.wav_to_mp3(wav_path, mp3_path)
         if not r.status:
             raise Exception(r.error)
+        logger.info(
+            "[trace=%s] ml.stage.done stage=generating_tts duration_ms=%s wav_path=%s mp3_path=%s",
+            trace_id,
+            int((perf_counter() - stage_started) * 1000),
+            wav_path,
+            mp3_path,
+        )
 
         # === ЭТАП 7: processing_frames (С ПОДЭТАПАМИ) ===
         total_images = len(images)
-        yield self._progress_message("processing_frames")
+        yield self._progress_message("processing_frames", trace_id=trace_id)
+        logger.info("[trace=%s] ml.stage.start stage=processing_frames total_images=%s", trace_id, total_images)
 
+        stage_started = perf_counter()
         ocr_response = self.ocr.batch(images)
         if not ocr_response.status:
             raise Exception(ocr_response.error)
@@ -276,8 +381,17 @@ class MLService:
 
         out_dir = os.path.join(base_dir, "frames_translated")
         os.makedirs(out_dir, exist_ok=True)
+        logger.info(
+            "[trace=%s] ml.processing_frames.prepare_done duration_ms=%s ocr_items=%s translated_items=%s output_dir=%s",
+            trace_id,
+            int((perf_counter() - stage_started) * 1000),
+            len(ocr_results),
+            len(translated),
+            out_dir,
+        )
 
         for index, img in enumerate(images, start=1):
+            image_started = perf_counter()
             image_response = service_utils.translate_images(
                 [img],
                 translated[index - 1:index],
@@ -290,11 +404,21 @@ class MLService:
                 "processing_frames",
                 current_step=index,
                 total_steps=total_images,
+                trace_id=trace_id,
             )
+            if index == 1 or index == total_images or index % 25 == 0:
+                logger.info(
+                    "[trace=%s] ml.processing_frames.step index=%s total=%s duration_ms=%s image=%s",
+                    trace_id,
+                    index,
+                    total_images,
+                    int((perf_counter() - image_started) * 1000),
+                    img,
+                )
 
         # === ЭТАП 8: assembling_video ===
-        yield self._progress_message("assembling_video")
-
+        yield self._progress_message("assembling_video", trace_id=trace_id)
+        stage_started = perf_counter()
         r = service_utils.create_video_with_new_audio(
             images_dir=out_dir,
             original_video_path=path,
@@ -303,6 +427,72 @@ class MLService:
         )
         if not r.status:
             raise Exception(r.error)
+        logger.info(
+            "[trace=%s] ml.stage.done stage=assembling_video duration_ms=%s output=%s",
+            trace_id,
+            int((perf_counter() - stage_started) * 1000),
+            os.path.join(self.temp_dir, f"{name}.mp4"),
+        )
+        logger.info("[trace=%s] ml.pipeline.complete output=%s", trace_id, os.path.join(self.temp_dir, f"{name}.mp4"))
+
+    @staticmethod
+    def _extract_trace_id(payload: dict) -> str:
+        trace_meta = payload.get("_trace")
+        if isinstance(trace_meta, dict):
+            trace_id = trace_meta.get("trace_id")
+            if trace_id:
+                return str(trace_id)
+        return "unknown"
+
+    @staticmethod
+    def _message_lag_ms(message: dict) -> int | None:
+        timestamp = message.get("timestamp")
+        if not timestamp:
+            return None
+        try:
+            event_time = datetime.fromisoformat(str(timestamp))
+        except ValueError:
+            return None
+        return int((datetime.now(timezone.utc) - event_time).total_seconds() * 1000)
+
+    def _log_message_created(self, trace_id: str, message: dict) -> None:
+        logger.debug(
+            "[trace=%s] message_created stage=%s progress=%s status=%s msg_ts=%s details=%s",
+            trace_id,
+            message.get("stage"),
+            message.get("progress"),
+            message.get("status"),
+            message.get("timestamp"),
+            message.get("details"),
+        )
+
+    def _log_yield_boundary(
+        self,
+        trace_id: str,
+        boundary: str,
+        message: dict,
+        *,
+        resume_gap_ms: int | None = None,
+    ) -> None:
+        lag_ms = self._message_lag_ms(message)
+        level = logging.DEBUG
+        if (lag_ms is not None and lag_ms >= STREAM_LAG_WARNING_MS) or (
+            resume_gap_ms is not None and resume_gap_ms >= STREAM_LAG_WARNING_MS
+        ):
+            level = logging.WARNING
+        logger.log(
+            level,
+            "[trace=%s] %s stage=%s progress=%s status=%s msg_ts=%s lag_ms=%s resume_gap_ms=%s details=%s",
+            trace_id,
+            boundary,
+            message.get("stage"),
+            message.get("progress"),
+            message.get("status"),
+            message.get("timestamp"),
+            lag_ms,
+            resume_gap_ms,
+            message.get("details"),
+        )
 
 
     def __process_video(self, path: str, name: str, result_dir: str) -> dict:
