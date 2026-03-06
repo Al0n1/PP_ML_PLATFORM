@@ -2,6 +2,7 @@
 HTTP transport layer for file processing.
 """
 
+import asyncio
 import logging
 import uuid
 from urllib.parse import urlparse
@@ -20,6 +21,13 @@ def _sanitize_url(url: str) -> str:
     parsed = urlparse(url)
     sanitized = parsed._replace(query="", fragment="")
     return sanitized.geturl()
+
+
+async def _stream_pipeline_events(message_stream):
+    """Yield SSE chunks with an explicit checkpoint between messages."""
+    async for event in message_stream:
+        yield event
+        await asyncio.sleep(0)
 
 
 class FileProcessRequest(BaseModel):
@@ -49,10 +57,12 @@ async def process_file_stream(
     headers = get_sse_headers()
     headers["X-Trace-Id"] = trace_id
     return StreamingResponse(
-        pipeline.process_stream(
-            request_body.download_url,
-            trace_id=trace_id,
-            client_host=client_host,
+        _stream_pipeline_events(
+            pipeline.process_stream(
+                request_body.download_url,
+                trace_id=trace_id,
+                client_host=client_host,
+            )
         ),
         media_type="text/event-stream",
         headers=headers,

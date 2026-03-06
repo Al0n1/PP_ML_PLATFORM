@@ -1,6 +1,7 @@
 """
 Сервис перевода видео.
 """
+import asyncio
 import os
 import shutil
 import logging
@@ -119,6 +120,10 @@ class MLService:
         if trace_id:
             self._log_message_created(trace_id, message)
         return message
+
+    async def _run_blocking(self, func, /, *args, **kwargs):
+        """Run blocking ML work off the event loop so SSE can flush promptly."""
+        return await asyncio.to_thread(func, *args, **kwargs)
 
     def execute(self, data: dict) -> dict:
         """
@@ -275,7 +280,7 @@ class MLService:
         # === ЭТАП 1: copying_file ===
         yield self._progress_message("copying_file", trace_id=trace_id)
         stage_started = perf_counter()
-        shutil.copy(path, base_dir)
+        await self._run_blocking(shutil.copy, path, base_dir)
         logger.info(
             "[trace=%s] ml.stage.done stage=copying_file duration_ms=%s destination=%s",
             trace_id,
@@ -286,11 +291,11 @@ class MLService:
         # === ЭТАП 2: splitting_frames ===
         yield self._progress_message("splitting_frames", trace_id=trace_id)
         stage_started = perf_counter()
-        r = service_utils.extract_frames(path, frames_output_dir)
+        r = await self._run_blocking(service_utils.extract_frames, path, frames_output_dir)
         if not r.status:
             raise Exception(r.error)
 
-        images = service_utils.get_image_paths(frames_output_dir)
+        images = await self._run_blocking(service_utils.get_image_paths, frames_output_dir)
         logger.info(
             "[trace=%s] ml.stage.done stage=splitting_frames duration_ms=%s frames=%s output_dir=%s",
             trace_id,
@@ -302,7 +307,7 @@ class MLService:
         # === ЭТАП 3: extracting_audio ===
         yield self._progress_message("extracting_audio", trace_id=trace_id)
         stage_started = perf_counter()
-        r = service_utils.extract_audio(path, extract_audio_path)
+        r = await self._run_blocking(service_utils.extract_audio, path, extract_audio_path)
         if not r.status:
             raise Exception(r.error)
         logger.info(
@@ -315,7 +320,7 @@ class MLService:
         # === ЭТАП 4: recognizing_speech ===
         yield self._progress_message("recognizing_speech", trace_id=trace_id)
         stage_started = perf_counter()
-        r = self.recognizer.transcribe(extract_audio_path)
+        r = await self._run_blocking(self.recognizer.transcribe, extract_audio_path)
         if not r.status:
             raise Exception(r.error)
         transcript = r.result
@@ -329,7 +334,7 @@ class MLService:
         # === ЭТАП 5: translating_text ===
         yield self._progress_message("translating_text", trace_id=trace_id)
         stage_started = perf_counter()
-        r = self.translator.translate(transcript)
+        r = await self._run_blocking(self.translator.translate, transcript)
         if not r.status:
             raise Exception(r.error)
         translation = r.result
@@ -346,11 +351,11 @@ class MLService:
         mp3_path = os.path.join(base_dir, f'{self.audio_translate_name}.mp3')
 
         stage_started = perf_counter()
-        r = self.generator.synthesize(translation, output_path=wav_path)
+        r = await self._run_blocking(self.generator.synthesize, translation, output_path=wav_path)
         if not r.status:
             raise Exception(r.error)
 
-        r = service_utils.wav_to_mp3(wav_path, mp3_path)
+        r = await self._run_blocking(service_utils.wav_to_mp3, wav_path, mp3_path)
         if not r.status:
             raise Exception(r.error)
         logger.info(
@@ -367,12 +372,13 @@ class MLService:
         logger.info("[trace=%s] ml.stage.start stage=processing_frames total_images=%s", trace_id, total_images)
 
         stage_started = perf_counter()
-        ocr_response = self.ocr.batch(images)
+        ocr_response = await self._run_blocking(self.ocr.batch, images)
         if not ocr_response.status:
             raise Exception(ocr_response.error)
         ocr_raw = ocr_response.result
-        ocr_results = self.ocr.ocr_to_dict(ocr_raw)
-        translated_response = service_utils.translate_ocr_results(
+        ocr_results = await self._run_blocking(self.ocr.ocr_to_dict, ocr_raw)
+        translated_response = await self._run_blocking(
+            service_utils.translate_ocr_results,
             self.translator, ocr_results
         )
         if not translated_response.status:
@@ -392,7 +398,8 @@ class MLService:
 
         for index, img in enumerate(images, start=1):
             image_started = perf_counter()
-            image_response = service_utils.translate_images(
+            image_response = await self._run_blocking(
+                service_utils.translate_images,
                 [img],
                 translated[index - 1:index],
                 output_dir=out_dir,
@@ -419,7 +426,8 @@ class MLService:
         # === ЭТАП 8: assembling_video ===
         yield self._progress_message("assembling_video", trace_id=trace_id)
         stage_started = perf_counter()
-        r = service_utils.create_video_with_new_audio(
+        r = await self._run_blocking(
+            service_utils.create_video_with_new_audio,
             images_dir=out_dir,
             original_video_path=path,
             new_audio_path=mp3_path,
