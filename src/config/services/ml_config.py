@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import ClassVar
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 class Settings(BaseSettings):
@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # ===== Paths =====
     TEMP_DIR: str = "var/temp"
     MODEL_CACHE_DIR: str = "var/model_cache"
+    ML_CLI_SOURCE_PATH: str = ""
 
     # ===== Translator =====
     TRANSLATOR_NAME: str = "glazzova/translation_en_ru"
