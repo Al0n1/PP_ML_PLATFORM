@@ -32,6 +32,6 @@ class Translator:
         # 2. Если будет передано изображение, то модель возьмет его как дополнительный контекст для перевода.
         # Ограничения: если модель не использует изображения, то второй вариант работать не будет.
 
-        result = self.model.translate(texts)
+        result = self.model.translate(texts, image=image)
         return Response(True, None, result)
     
