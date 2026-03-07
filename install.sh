@@ -9,7 +9,7 @@ PADDLE_VERSION="3.2.0"
 PADDLE_CPU_INDEX="https://www.paddlepaddle.org.cn/packages/stable/cpu/"
 PADDLE_CU118_INDEX="https://www.paddlepaddle.org.cn/packages/stable/cu118/"
 PADDLE_CU126_INDEX="https://www.paddlepaddle.org.cn/packages/stable/cu126/"
-PADDLEOCR_URL="paddleocr@git+https://github.com/PaddlePaddle/PaddleOCR.git"
+PADDLEOCR_URL="paddleocr[all]"
 
 TORCH_VERSION="2.9.0"
 TORCH_CPU_INDEX="https://download.pytorch.org/whl/cpu"
