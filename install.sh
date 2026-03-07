@@ -11,6 +11,11 @@ PADDLE_CU118_INDEX="https://www.paddlepaddle.org.cn/packages/stable/cu118/"
 PADDLE_CU126_INDEX="https://www.paddlepaddle.org.cn/packages/stable/cu126/"
 PADDLEOCR_URL="paddleocr@git+https://github.com/PaddlePaddle/PaddleOCR.git"
 
+TORCH_VERSION="2.9.0"
+TORCH_CPU_INDEX="https://download.pytorch.org/whl/cpu"
+TORCH_CU118_INDEX="https://download.pytorch.org/whl/cu118"
+TORCH_CU126_INDEX="https://download.pytorch.org/whl/cu126"
+
 # ---- Определение режима GPU --------------------------------
 
 detect_gpu_mode() {
@@ -41,6 +46,24 @@ detect_gpu_mode() {
 echo "=== Установка основных зависимостей ==="
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+
+echo ""
+echo "=== Установка PyTorch ==="
+
+case "$MODE" in
+    cpu)
+        echo "Установка torch + torchaudio (CPU)..."
+        python -m pip install "torch==${TORCH_VERSION}" "torchaudio" --index-url "$TORCH_CPU_INDEX"
+        ;;
+    cu118)
+        echo "Установка torch + torchaudio (CUDA 11.8)..."
+        python -m pip install "torch==${TORCH_VERSION}" "torchaudio" --index-url "$TORCH_CU118_INDEX"
+        ;;
+    cu126)
+        echo "Установка torch + torchaudio (CUDA 12.6)..."
+        python -m pip install "torch==${TORCH_VERSION}" "torchaudio" --index-url "$TORCH_CU126_INDEX"
+        ;;
+esac
 
 echo ""
 echo "=== Установка PaddlePaddle ==="
