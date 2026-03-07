@@ -95,7 +95,10 @@ def main(argv: list[str] | None = None) -> int:
 
     from src.services.ml_service.ml_service import MLService
 
-    ml_service = MLService()
+    ml_settings.TRANSLATOR_DEVICE = args.device_translator
+    ml_settings.RECOGNIZER_DEVICE = args.device_recognizer
+    ml_settings.OCR_DEVICE = args.device_ocr
+    ml_service = MLService(settings=ml_settings)
     result = ml_service.execute({"path": str(source_path)})
 
     if result.get("status") != "success":
