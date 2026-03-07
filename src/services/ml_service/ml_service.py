@@ -67,7 +67,7 @@ class MLService:
         temp_dir (str): Временная директория для промежуточных файлов.
     """
 
-    def __init__(self, temp_dir=settings.TEMP_DIR):
+    def __init__(self, temp_dir=settings.TEMP_DIR, settings=settings):
         """
         Инициализация ML-сервиса.
 
@@ -83,6 +83,8 @@ class MLService:
         self.stage_progress = dict(STAGE_PROGRESS)
         self.stage_order = list(self.stage_progress.keys())
 
+        self.settings = settings
+
         with log_duration("INIT models"):
             self._init_models()
             
@@ -92,17 +94,17 @@ class MLService:
         from huggingface_hub import login
         login()
         with log_duration("Translator.__init__"):
-            self.translator = Translator(settings)
+            self.translator = Translator(self.settings)
             # self.translator = models.UniversalTranslator(settings.TRANSLATOR_NAME, device=settings.TRANSLATOR_DEVICE, model_type=settings.TRANSLATOR_TYPE)
         
         with log_duration("SimpleWhisper.__init__"):
-            self.recognizer = models.SimpleWhisper(device=settings.RECOGNIZER_DEVICE, model_name=settings.RECOGNIZER_NAME)
+            self.recognizer = models.SimpleWhisper(device=self.settings.RECOGNIZER_DEVICE, model_name=self.settings.RECOGNIZER_NAME)
 
         with log_duration("TextToSpeech.__init__"):
             self.generator = models.TextToSpeech()
 
         with log_duration("OCR.__init__"):
-            self.ocr = models.OCR(device=settings.OCR_DEVICE)
+            self.ocr = models.OCR(device=self.settings.OCR_DEVICE)
 
     def _progress_message(
         self,
