@@ -5,8 +5,9 @@ import json
 
 
 class BaseOCR:
-    def __init__(self, device: str = None):
+    def __init__(self, device: str = None, name: str = 'base'):
         self.device = device
+        self.name = name
 
     def process(self, images: List[Union[str, Image.Image, np.ndarray]]) -> List[Dict[str, Union[str, List[float]]]]:
         raise NotImplementedError("Subclasses must implement this method")

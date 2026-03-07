@@ -31,7 +31,7 @@ class DOCTR(BaseOCR):
                  det_name: str = 'fast_base',
                  reco_name: str = 'crnn_vgg16_bn',
                  device: str = None):
-        super().__init__(device=device)
+        super().__init__(device=device, name='doctr')
         self.model = ocr_predictor(det_arch=det_name,
                                    reco_arch=reco_name,
                                    pretrained=True).to(self.device)
