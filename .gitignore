@@ -11,3 +11,4 @@ mdr_*
 data/
 dev/*
 secrets/
+deploy/*
