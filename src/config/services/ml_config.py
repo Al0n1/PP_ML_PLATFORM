@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     RECOGNIZER_DEVICE: str = "cpu"
 
     # ===== OCR =====
+    OCR_TYPE: str = "doctr"
+    OCR_NAME: str = "fast_base|||crnn_vgg16_bn"
     OCR_DEVICE: str = "mps"
 
 
