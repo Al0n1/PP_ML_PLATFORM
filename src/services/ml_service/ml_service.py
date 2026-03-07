@@ -662,8 +662,9 @@ class MLService:
                 # logger.info(f"[frame {i}/{len(results)}] Translating {len(texts)} text(s)")
                 resp: service_utils.Response = self.translator.translate(texts)
                 # print(resp.result)
-                for item, translate in zip(result, resp.result['text']):
-                    item['translation'] = translate
+                if isinstance(resp.result, dict) and 'text' in resp.result:
+                    for item, translate in zip(result, resp.result['text']):
+                        item['translation'] = translate
             resp: service_utils.Response = service_utils.Response(True, None, results)
             # resp: service_utils.Response = service_utils.translate_ocr_results(self.translator, results)
             if resp.status is False:
