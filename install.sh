@@ -99,5 +99,9 @@ echo ""
 echo "=== Установка PaddleOCR ==="
 python -m pip install "$PADDLEOCR_URL"
 
+echo "=== Установка основных зависимостей ==="
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
 echo ""
 echo "=== Готово ==="
