@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from control_service.app import build_app
 from control_service.config import ControlServiceSettings
-from control_service.models import HealthCheckResult, LogEntry, RunResult
+from control_service.models import HealthCheckResult, LogEntry, MLEnvBlockResponse, RunResult
 
 AUTH_HEADERS = {"Authorization": "Bearer test-token"}
 
@@ -41,6 +41,11 @@ class FakeRunner:
         )
         self.delay = delay
         self.run_calls = 0
+        self.ml_env = MLEnvBlockResponse(
+            env_file="/tmp/.env",
+            block="###< ML Service\nTRANSLATOR_DEVICE=cpu\n###>",
+            params={"TRANSLATOR_DEVICE": "cpu"},
+        )
 
     async def run_health(self) -> HealthCheckResult:
         return self.health_result
@@ -54,6 +59,20 @@ class FakeRunner:
         if self.run_result.exit_code != 0:
             await on_log(LogEntry(ts="2026-03-07T00:00:02+00:00", stream="stderr", line="pipeline failed"))
         return self.run_result
+
+    async def get_ml_env(self) -> MLEnvBlockResponse:
+        return self.ml_env
+
+    async def update_ml_env(self, params: dict[str, str]) -> MLEnvBlockResponse:
+        merged = dict(self.ml_env.params)
+        merged.update(params)
+        block_lines = ["###< ML Service", *[f"{key}={value}" for key, value in merged.items()], "###>"]
+        self.ml_env = MLEnvBlockResponse(
+            env_file=self.ml_env.env_file,
+            block="\n".join(block_lines),
+            params=merged,
+        )
+        return self.ml_env
 
 
 class ControlServiceTestCase(unittest.TestCase):
@@ -181,6 +200,40 @@ class ControlServiceTestCase(unittest.TestCase):
                 lines = [entry["line"] for entry in recent_logs.json()]
                 self.assertIn("pipeline failed", lines)
                 self.assertEqual(lines[-1], "Job failed (exit_code=1): Working tree is dirty")
+
+    def test_ml_env_get_returns_current_block(self) -> None:
+        runner = FakeRunner()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self._build_test_client(temp_dir, runner) as client:
+                response = client.get("/api/ml-env", headers=AUTH_HEADERS)
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["env_file"], "/tmp/.env")
+        self.assertEqual(payload["params"]["TRANSLATOR_DEVICE"], "cpu")
+
+    def test_ml_env_put_merges_passed_params(self) -> None:
+        runner = FakeRunner()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self._build_test_client(temp_dir, runner) as client:
+                response = client.put(
+                    "/api/ml-env",
+                    headers=AUTH_HEADERS,
+                    json={
+                        "params": {
+                            "TRANSLATOR_DEVICE": "mps",
+                            "OCR_DEVICE": "cpu",
+                        }
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["params"]["TRANSLATOR_DEVICE"], "mps")
+        self.assertEqual(payload["params"]["OCR_DEVICE"], "cpu")
+        self.assertIn("OCR_DEVICE=cpu", payload["block"])
 
 
 if __name__ == "__main__":
