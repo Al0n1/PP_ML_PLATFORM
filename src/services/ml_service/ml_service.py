@@ -13,6 +13,7 @@ from time import perf_counter
 from . import utils as service_utils
 from . import n_models as models
 from src.services.ml_service.translator import Translator
+from src.services.ml_service.ocr import OCR
 from src.config.services.ml_config import settings
 from src.utils.sse_messages import build_error, build_progress, build_success
 
@@ -104,7 +105,8 @@ class MLService:
             self.generator = models.TextToSpeech()
 
         with log_duration("OCR.__init__"):
-            self.ocr = models.OCR(device=self.settings.OCR_DEVICE)
+            # self.ocr = models.OCR(device=self.settings.OCR_DEVICE)
+            self.ocr = OCR(config=self.settings)
 
     def _progress_message(
         self,
@@ -384,11 +386,11 @@ class MLService:
         logger.info("[trace=%s] ml.stage.start stage=processing_frames total_images=%s", trace_id, total_images)
 
         stage_started = perf_counter()
-        ocr_response = await self._run_blocking(self.ocr.batch, images)
+        ocr_response = await self._run_blocking(self.ocr.process, images)
         if not ocr_response.status:
             raise Exception(ocr_response.error)
-        ocr_raw = ocr_response.result
-        ocr_results = await self._run_blocking(self.ocr.ocr_to_dict, ocr_raw)
+        ocr_results = ocr_response.result
+        # ocr_results = await self._run_blocking(self.ocr.ocr_to_dict, ocr_raw)
         translated_response = await self._run_blocking(
             service_utils.translate_ocr_results,
             self.translator, ocr_results
@@ -640,14 +642,19 @@ class MLService:
 
         chosed_images = [img for idx, img in enumerate(images) if idx in key_frames]
 
-
         with log_duration("OCR"):
-            resp: service_utils.Response = self.ocr.batch(chosed_images)
+            resp: service_utils.Response = self.ocr.process(chosed_images)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)
             results = resp.result
 
             resp: service_utils.Response = self.ocr.save_results_to_json(results, ocr_out_path)
+
+            # TODO: удалить после тестов
+            test_path = os.path.join('var/data/video', f"ocr_results.json")
+            resp: service_utils.Response = self.ocr.save_results_to_json(results, test_path)
+
+            
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)
             
