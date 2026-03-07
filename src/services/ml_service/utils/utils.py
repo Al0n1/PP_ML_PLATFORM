@@ -50,6 +50,7 @@ def save_json(data, path):
 def translate_ocr_results(translator, data):
     # карта уникальных страниц (длина == data)
     unique_map = fill_with_unique(data)
+    #TODO: Реализовать более эффективный способ получения уникальных текстов для перевода, чтобы не переводить дубликаты. Сейчас мы просто переводим все, а потом копируем переводы в дубликаты. Это может быть неэффективно при большом количестве страниц с одинаковым текстом.
     unique_idxs = sorted(set(unique_map))
 
     texts = []
@@ -58,7 +59,7 @@ def translate_ocr_results(translator, data):
             texts.append(item["text"])
 
     # 2. Переводим
-    resp: Response = translator.batch_translate(texts)
+    resp: Response = translator.translate(texts)
     if resp.status is False:
         return resp
     translations = resp.result

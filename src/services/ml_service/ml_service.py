@@ -7,22 +7,29 @@ import shutil
 import logging
 from datetime import datetime, timezone
 from typing import AsyncIterator
-from src.config.services.ml_config import settings
-from src.utils.sse_messages import build_error, build_progress, build_success
-from . import utils as service_utils
-from . import n_models as models
 from contextlib import contextmanager
 from time import perf_counter
+
+from . import utils as service_utils
+from . import n_models as models
+from src.services.ml_service.translator import Translator
+from src.config.services.ml_config import settings
+from src.utils.sse_messages import build_error, build_progress, build_success
 
 STREAM_LAG_WARNING_MS = 5_000
 
 @contextmanager
-def log_duration(message: str):
-    logger.info(f"⌛{message}")
+def log_duration(message: str | None = None, func_name: str | None = None):
+
+    name = message or func_name
+
+    # logger.info(f"⌛ {name}")
     start = perf_counter()
+
     yield
+
     end = perf_counter()
-    logger.info(f"Время выполнения: {end - start:.4f} сек")
+    logger.info(f"⏱ {name} finished in {end - start:.4f} sec")
 
 
 
@@ -82,8 +89,11 @@ class MLService:
         self.temp_dir = temp_dir
 
     def _init_models(self):
-        with log_duration("UniversalTranslator.__init__"):
-            self.translator = models.UniversalTranslator(settings.TRANSLATOR_NAME, device=settings.TRANSLATOR_DEVICE, model_type=settings.TRANSLATOR_TYPE)
+        from huggingface_hub import login
+        login()
+        with log_duration("Translator.__init__"):
+            self.translator = Translator(settings)
+            # self.translator = models.UniversalTranslator(settings.TRANSLATOR_NAME, device=settings.TRANSLATOR_DEVICE, model_type=settings.TRANSLATOR_TYPE)
         
         with log_duration("SimpleWhisper.__init__"):
             self.recognizer = models.SimpleWhisper(device=settings.RECOGNIZER_DEVICE, model_name=settings.RECOGNIZER_NAME)
@@ -542,7 +552,8 @@ class MLService:
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
             
-            resp: service_utils.Response = service_utils.extract_frames(path, frames_output_dir)   
+            # resp: service_utils.Response = service_utils.extract_frames(path, frames_output_dir)  
+            key_frames, total_frames = service_utils.extract_key_frames(path, frames_output_dir, save_all_frames=True)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)          
 
@@ -551,7 +562,7 @@ class MLService:
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
             
-            resp: service_utils.Response = self._video_process(path, self.temp_dir, name)
+            resp: service_utils.Response = self._video_process(path, self.temp_dir, name, {'key_frames': key_frames, 'total_frames': total_frames})
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
 
@@ -595,13 +606,13 @@ class MLService:
                 f.write(transcript)
             
         with log_duration("Translator.translate"):
-            resp: service_utils.Response = self.translator.translate(transcript)
+            resp: service_utils.Response = self.translator.translate([transcript])
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)
-            translation = resp.result
+            translation = resp.result['text'][0] # берем первый элемент, так как передавали список из одного текста
             path = os.path.join(temp_dir, name, f"audio_text_translation.txt")
             with open(path, "w", encoding="utf-8") as f:
-                f.write(translation)
+                f.write(translation) # берем первый элемент, так как передавали список из одного текста
 
         with log_duration("TextToSpeech.synthesize"):
             resp: service_utils.Response = self.generator.synthesize(translation, output_path=translated_wav)
@@ -615,14 +626,21 @@ class MLService:
         
         return service_utils.Response(True, None, None)
 
-    def _video_process(self, path, temp_dir, name):
+    def _video_process(self, path, temp_dir, name, extra_info):
+        log_duration("Video OCR and Translation")
+        key_frames = extra_info.get('key_frames', [])
+        total_frames = extra_info.get('total_frames', 0)
+
         frames_dir = os.path.join(temp_dir, name, 'frames')
         images = service_utils.get_image_paths(frames_dir)
         output_dir = os.path.join(temp_dir, name, 'frames_translated')
         ocr_out_path = os.path.join(temp_dir, name, f'ocr.json')
 
+        chosed_images = [img for idx, img in enumerate(images) if idx in key_frames]
+
+
         with log_duration("OCR"):
-            resp: service_utils.Response = self.ocr.batch(images)
+            resp: service_utils.Response = self.ocr.batch(chosed_images)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)
             results = resp.result
@@ -630,22 +648,66 @@ class MLService:
             resp: service_utils.Response = self.ocr.save_results_to_json(results, ocr_out_path)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)
-    
+            
+        from tqdm import tqdm
         with log_duration("Translate"):
             results = service_utils.load_json(ocr_out_path)
-            resp: service_utils.Response = service_utils.translate_ocr_results(self.translator, results)
+            for i, result in enumerate(
+                tqdm(results, desc="Translating OCR texts", unit="frame", ncols=100, colour="green"),
+                start=1,
+            ):
+                texts = [item['text'] for item in result]
+                # logger.info(f"[frame {i}/{len(results)}] Translating {len(texts)} text(s)")
+                resp: service_utils.Response = self.translator.translate(texts)
+                # print(resp.result)
+                for item, translate in zip(result, resp.result['text']):
+                    item['translation'] = translate
+            resp: service_utils.Response = service_utils.Response(True, None, results)
+            # resp: service_utils.Response = service_utils.translate_ocr_results(self.translator, results)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)
             translated_data = resp.result
             service_utils.save_json(translated_data, os.path.join(temp_dir, name, 'video_text.json'))
 
+        id_to_id = {k: i for i, k in enumerate(key_frames)}
+        print(type(translated_data))
+        indices = key_frames
+        t = total_frames
+
+        results = []
+        indices_ext = key_frames + [total_frames]
+
+        results = [
+            k
+            for i, k in enumerate(key_frames)
+            for _ in range(indices_ext[i+1] - k)
+        ]
+
+        print(results, len(results))
+
+        imgs = [images[id_result] for id_result in results]
+        trans = [translated_data[id_to_id[id_result]] for id_result in results]
         with log_duration('Re translate'):
             resp: service_utils.Response = service_utils.translate_images(
-                images,
-                translated_data,
+                imgs,
+                trans,
                 output_dir=output_dir,
                 font_path="arial.ttf"
             )
+            if resp.status is False:
+                return service_utils.Response(False, resp.error, None) 
+
+
+
+
+
+        # with log_duration('Re translate'):
+        #     resp: service_utils.Response = service_utils.translate_images(
+        #         chosed_images,
+        #         translated_data,
+        #         output_dir=output_dir,
+        #         font_path="arial.ttf"
+        #     )
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
         

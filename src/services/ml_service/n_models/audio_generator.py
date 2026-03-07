@@ -1,3 +1,4 @@
+import re
 from transformers import VitsModel, AutoTokenizer
 import torch
 import scipy.io.wavfile as wavfile
@@ -27,8 +28,28 @@ class TextToSpeech:
             output_path (str): путь для сохранения WAV-файла.
         """
         try:
+            if not text or not text.strip():
+                return Response(False, "TTS input text is empty", None)
+
+            # Check that the text contains at least some word characters
+            # (not just punctuation/dots which the tokenizer may discard entirely)
+            if not re.search(r'\w', text):
+                return Response(
+                    False,
+                    f"TTS input text contains no usable characters: {text[:100]!r}",
+                    None,
+                )
+
             inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
-            
+
+            # Guard against empty input_ids after tokenization
+            if inputs.input_ids.numel() == 0 or inputs.input_ids.shape[-1] == 0:
+                return Response(
+                    False,
+                    f"TTS tokenizer produced empty input_ids for text: {text[:100]!r}",
+                    None,
+                )
+
             with torch.no_grad():
                 waveform = self.model(**inputs).waveform
 

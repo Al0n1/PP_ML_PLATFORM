@@ -32,6 +32,24 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         help="Absolute path or path relative to the current working directory.",
     )
+    parser.add_argument(
+        "--device_ocr",
+        type=str,
+        default="cpu",
+        help="Absolute path or path relative to the current working directory.",
+    )
+    parser.add_argument(
+        "--device_translator",
+        type=str,
+        default="cpu",
+        help="Absolute path or path relative to the current working directory.",
+    )
+    parser.add_argument(
+        "--device_recognizer",
+        type=str,
+        default="cpu",
+        help="Absolute path or path relative to the current working directory.",
+    )
     return parser
 
 

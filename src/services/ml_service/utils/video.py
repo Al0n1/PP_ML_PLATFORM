@@ -1,4 +1,5 @@
 import cv2
+import numpy as np
 import os
 from .utils import Response
 # try:
@@ -9,6 +10,66 @@ try:
     from moviepy import ImageSequenceClip, AudioFileClip, VideoFileClip
 except ImportError:
     print("moviepy is not installed. Audio extraction will not work.")
+
+
+def extract_key_frames(
+    video_path: str,
+    save_folder: str = "var/data_ocr/frames",
+    threshold: float = 1.0,
+    save_key_frames: bool = False,
+    save_all_frames: bool = False,
+) -> tuple[list[int], int]:
+    """Извлекает ключевые кадры из видео на основе попиксельной разницы.
+
+    Args:
+        video_path: Путь к видеофайлу.
+        save_folder: Папка для сохранения кадров.
+        threshold: Порог средней попиксельной разницы для определения ключевого кадра.
+        save_key_frames: Сохранять только ключевые кадры в save_folder.
+        save_all_frames: Сохранять все кадры в save_folder.
+
+    Returns:
+        Кортеж (список индексов ключевых кадров, общее количество кадров).
+    """
+    os.makedirs(save_folder, exist_ok=True)
+    cap = cv2.VideoCapture(video_path)
+
+    key_frames: list[int] = []
+
+    ret, prev_frame = cap.read()
+    if not ret:
+        cap.release()
+        return [], 0
+
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+
+    frame_idx = 1
+    key_frames.append(1)  # Добавляем первый кадр как ключевой
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        if save_all_frames:
+            cv2.imwrite(f"{save_folder}/frame_{frame_idx:06d}.jpg", frame)
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        diff = cv2.absdiff(gray, prev_gray)
+        score = np.mean(diff)
+        if score > threshold:
+            key_frames.append(frame_idx)
+
+            if save_key_frames and not save_all_frames:
+                cv2.imwrite(f"{save_folder}/frame_{frame_idx:06d}.jpg", frame)
+
+        prev_gray = gray
+        frame_idx += 1
+
+    cap.release()
+    return key_frames, frame_idx
+
 
 
 def extract_frames(path: str, output_dir: str):
@@ -44,7 +105,7 @@ def extract_audio(video_path, output_audio_path):
             audio.write_audiofile(output_audio_path)
         return Response(True, None, None)
     except Exception as e:
-        return Response(False, e, None)
+        return Response(False, str(e), None)
         
 
 def create_video_with_new_audio(images_dir, original_video_path, new_audio_path, output_video_path):
