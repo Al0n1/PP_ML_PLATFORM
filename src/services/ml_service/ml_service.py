@@ -648,13 +648,13 @@ class MLService:
                 return service_utils.Response(False, resp.error, None)
             results = resp.result
 
-            resp: service_utils.Response = self.ocr.save_results_to_json(results, ocr_out_path)
+            resp: service_utils.Response = self.ocr.save(results, ocr_out_path)
 
             # TODO: удалить после тестов
-            test_path = os.path.join('var/data/video', f"ocr_results.json")
-            resp: service_utils.Response = self.ocr.save_results_to_json(results, test_path)
+            # test_path = os.path.join('var/data/video', f"{self.ocr.model.name}_ocr_results.json")
+            # resp: service_utils.Response = self.ocr.save(results, test_path)
 
-            
+
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)
             
