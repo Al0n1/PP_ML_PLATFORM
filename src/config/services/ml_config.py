@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     TEMP_DIR: str = "var/temp"
     MODEL_CACHE_DIR: str = "var/model_cache"
     ML_CLI_SOURCE_PATH: str = ""
+    FFMPEG_BINARY: str = ""
+    FFPROBE_BINARY: str = ""
 
     # ===== Translator =====
     TRANSLATOR_NAME: str = "glazzova/translation_en_ru"

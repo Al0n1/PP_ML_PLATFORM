@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ACTION="${1:-run}"
-TARGET_BRANCH="${2:-main}"
+TARGET_BRANCH="${2:-master}"
 
 REPO_DIR="${PP_ML_REPO_DIR:-$HOME/Desktop/PP_ML_PLATFORM}"
 VENV_DIR="${PP_ML_VENV_DIR:-$REPO_DIR/.venv}"
@@ -36,6 +36,72 @@ activate_python() {
         exit 1
     fi
     export PYTHONUNBUFFERED=1
+}
+
+resolve_media_binary() {
+    local binary_name="$1"
+    local explicit_value="${2:-}"
+    local login_shell="${PP_ML_LOGIN_SHELL:-${SHELL:-/bin/zsh}}"
+    local candidate=""
+
+    if [[ -n "$explicit_value" ]]; then
+        if [[ -x "$explicit_value" ]]; then
+            printf '%s\n' "$explicit_value"
+            return 0
+        fi
+        if candidate="$(command -v "$explicit_value" 2>/dev/null)"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    if candidate="$(command -v "$binary_name" 2>/dev/null)"; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    if [[ -x "$login_shell" ]]; then
+        candidate="$("$login_shell" -lc "command -v $binary_name" 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    fi
+
+    for candidate in \
+        "/opt/homebrew/bin/$binary_name" \
+        "/usr/local/bin/$binary_name" \
+        "/opt/local/bin/$binary_name"
+    do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+configure_media_env() {
+    local ffmpeg_bin=""
+    local ffprobe_bin=""
+
+    ffmpeg_bin="$(resolve_media_binary ffmpeg "${PP_ML_FFMPEG_BIN:-${FFMPEG_BINARY:-}}")" || {
+        emit_error "ffmpeg binary was not found. Export PP_ML_FFMPEG_BIN or set FFMPEG_BINARY in .env."
+        exit 1
+    }
+
+    ffprobe_bin="$(resolve_media_binary ffprobe "${PP_ML_FFPROBE_BIN:-${FFPROBE_BINARY:-}}")" || true
+
+    export PP_ML_FFMPEG_BIN="$ffmpeg_bin"
+    export FFMPEG_BINARY="$ffmpeg_bin"
+    export IMAGEIO_FFMPEG_EXE="$ffmpeg_bin"
+    export PATH="$(dirname "$ffmpeg_bin"):$PATH"
+
+    if [[ -n "$ffprobe_bin" ]]; then
+        export PP_ML_FFPROBE_BIN="$ffprobe_bin"
+        export FFPROBE_BINARY="$ffprobe_bin"
+    fi
 }
 
 ensure_clean_worktree() {
@@ -156,6 +222,7 @@ PY
 run_health() {
     require_repo
     activate_python
+    configure_media_env
 
     local current_sha
     local git_ok=false
@@ -199,6 +266,7 @@ run_health() {
 run_pipeline() {
     require_repo
     activate_python
+    configure_media_env
     ensure_clean_worktree
 
     local git_sha_before

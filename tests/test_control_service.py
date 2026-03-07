@@ -14,6 +14,7 @@ from control_service.config import ControlServiceSettings
 from control_service.models import HealthCheckResult, LogEntry, MLEnvBlockResponse, RunResult
 
 AUTH_HEADERS = {"Authorization": "Bearer test-token"}
+BASE_PATH = "/test-ml-pipline-1"
 
 
 class FakeRunner:
@@ -88,7 +89,7 @@ class ControlServiceTestCase(unittest.TestCase):
     def _wait_for_terminal_status(self, client: TestClient, job_id: str) -> dict:
         deadline = time.time() + 5
         while time.time() < deadline:
-            response = client.get(f"/api/run/{job_id}", headers=AUTH_HEADERS)
+            response = client.get(f"{BASE_PATH}/api/run/{job_id}", headers=AUTH_HEADERS)
             response.raise_for_status()
             payload = response.json()
             if payload["status"] in {"success", "failed"}:
@@ -99,9 +100,17 @@ class ControlServiceTestCase(unittest.TestCase):
     def test_auth_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             with self._build_test_client(temp_dir, FakeRunner()) as client:
-                response = client.get("/api/health")
+                response = client.get(f"{BASE_PATH}/api/health")
 
         self.assertEqual(response.status_code, 401)
+
+    def test_root_redirects_to_base_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self._build_test_client(temp_dir, FakeRunner()) as client:
+                response = client.get("/", follow_redirects=False)
+
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(response.headers["location"], f"{BASE_PATH}/")
 
     def test_health_endpoint_returns_runner_status(self) -> None:
         runner = FakeRunner(
@@ -118,7 +127,7 @@ class ControlServiceTestCase(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with self._build_test_client(temp_dir, runner) as client:
-                response = client.get("/api/health", headers=AUTH_HEADERS)
+                response = client.get(f"{BASE_PATH}/api/health", headers=AUTH_HEADERS)
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -131,7 +140,7 @@ class ControlServiceTestCase(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with self._build_test_client(temp_dir, runner) as client:
-                response = client.post("/api/run/update", headers=AUTH_HEADERS)
+                response = client.post(f"{BASE_PATH}/api/run/update", headers=AUTH_HEADERS)
                 self.assertEqual(response.status_code, 202)
                 job_id = response.json()["job_id"]
 
@@ -141,7 +150,7 @@ class ControlServiceTestCase(unittest.TestCase):
                 self.assertEqual(final_payload["git_sha_after"], "bbb222")
                 self.assertEqual(final_payload["output_path"], "/tmp/output.mp4")
 
-                stream_response = client.get(f"/api/run/{job_id}/stream", headers=AUTH_HEADERS)
+                stream_response = client.get(f"{BASE_PATH}/api/run/{job_id}/stream", headers=AUTH_HEADERS)
                 self.assertEqual(stream_response.status_code, 200)
                 lines = [json.loads(line) for line in stream_response.text.splitlines() if line.strip()]
                 self.assertEqual(
@@ -154,7 +163,7 @@ class ControlServiceTestCase(unittest.TestCase):
                     ],
                 )
 
-                recent_logs = client.get("/api/logs/recent?limit=10", headers=AUTH_HEADERS)
+                recent_logs = client.get(f"{BASE_PATH}/api/logs/recent?limit=10", headers=AUTH_HEADERS)
                 self.assertEqual(recent_logs.status_code, 200)
                 recent_payload = recent_logs.json()
                 self.assertEqual(recent_payload[-1]["line"], "Job finished successfully (exit_code=0)")
@@ -164,11 +173,11 @@ class ControlServiceTestCase(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with self._build_test_client(temp_dir, runner) as client:
-                first = client.post("/api/run/update", headers=AUTH_HEADERS)
+                first = client.post(f"{BASE_PATH}/api/run/update", headers=AUTH_HEADERS)
                 self.assertEqual(first.status_code, 202)
                 first_job_id = first.json()["job_id"]
 
-                second = client.post("/api/run/update", headers=AUTH_HEADERS)
+                second = client.post(f"{BASE_PATH}/api/run/update", headers=AUTH_HEADERS)
                 self.assertEqual(second.status_code, 409)
                 self.assertEqual(second.json()["detail"]["job_id"], first_job_id)
 
@@ -187,7 +196,7 @@ class ControlServiceTestCase(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with self._build_test_client(temp_dir, runner) as client:
-                response = client.post("/api/run/update", headers=AUTH_HEADERS)
+                response = client.post(f"{BASE_PATH}/api/run/update", headers=AUTH_HEADERS)
                 self.assertEqual(response.status_code, 202)
                 job_id = response.json()["job_id"]
 
@@ -195,7 +204,7 @@ class ControlServiceTestCase(unittest.TestCase):
                 self.assertEqual(final_payload["status"], "failed")
                 self.assertEqual(final_payload["error_summary"], "Working tree is dirty")
 
-                recent_logs = client.get("/api/logs/recent?limit=10", headers=AUTH_HEADERS)
+                recent_logs = client.get(f"{BASE_PATH}/api/logs/recent?limit=10", headers=AUTH_HEADERS)
                 self.assertEqual(recent_logs.status_code, 200)
                 lines = [entry["line"] for entry in recent_logs.json()]
                 self.assertIn("pipeline failed", lines)
@@ -206,7 +215,7 @@ class ControlServiceTestCase(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             with self._build_test_client(temp_dir, runner) as client:
-                response = client.get("/api/ml-env", headers=AUTH_HEADERS)
+                response = client.get(f"{BASE_PATH}/api/ml-env", headers=AUTH_HEADERS)
 
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -219,7 +228,7 @@ class ControlServiceTestCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             with self._build_test_client(temp_dir, runner) as client:
                 response = client.put(
-                    "/api/ml-env",
+                    f"{BASE_PATH}/api/ml-env",
                     headers=AUTH_HEADERS,
                     json={
                         "params": {
