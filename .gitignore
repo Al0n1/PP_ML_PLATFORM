@@ -12,4 +12,4 @@ data/
 dev/*
 secrets/
 deploy/*
-vendor/*
+vendor/
