@@ -4,7 +4,7 @@ set -euo pipefail
 ACTION="${1:-run}"
 TARGET_BRANCH="${2:-main}"
 
-REPO_DIR="${PP_ML_REPO_DIR:-$HOME/PP_ML_PLATFORM}"
+REPO_DIR="${PP_ML_REPO_DIR:-$HOME/Desktop/PP_ML_PLATFORM}"
 VENV_DIR="${PP_ML_VENV_DIR:-$REPO_DIR/.venv}"
 PYTHON_BIN="${PP_ML_PYTHON_BIN:-$VENV_DIR/bin/python}"
 CLI_MODULE="${PP_ML_CLI_MODULE:-src.command.ml_service}"
