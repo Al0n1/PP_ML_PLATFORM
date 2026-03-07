@@ -43,9 +43,12 @@ detect_gpu_mode() {
 
 # ---- Основной блок ------------------------------------------
 
-echo "=== Установка основных зависимостей ==="
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+MODE="${1:-auto}"   # cpu | cu118 | cu126 | auto
+
+if [[ "$MODE" == "auto" ]]; then
+    MODE=$(detect_gpu_mode)
+    echo "Автоопределение: mode=$MODE"
+fi
 
 echo ""
 echo "=== Установка PyTorch ==="
@@ -67,13 +70,6 @@ esac
 
 echo ""
 echo "=== Установка PaddlePaddle ==="
-
-MODE="${1:-auto}"   # cpu | cu118 | cu126 | auto
-
-if [[ "$MODE" == "auto" ]]; then
-    MODE=$(detect_gpu_mode)
-    echo "Автоопределение: mode=$MODE"
-fi
 
 case "$MODE" in
     cpu)
