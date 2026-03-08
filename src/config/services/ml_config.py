@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     TRANSLATOR_DEVICE: str = "mps"
 
     # ===== Speech recognition =====
+    RECOGNIZER_TYPE: str = "whisper"
     RECOGNIZER_NAME: str = "medium"
     RECOGNIZER_DEVICE: str = "cpu"
 
