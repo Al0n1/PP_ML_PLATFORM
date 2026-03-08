@@ -72,25 +72,23 @@ def extract_key_frames(
 
 
 
-def extract_frames(path: str, output_dir: str):
-    os.makedirs(output_dir, exist_ok=True)
-    cap = cv2.VideoCapture(path, cv2.CAP_FFMPEG)
+def extract_frames(video_path: str) -> Response:
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         # Попытка открыть снова без указания backend
-        cap = cv2.VideoCapture( path)
+        cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             return Response(False,'Не удалось открыть видеофайл', None)
     # Успешное открытие видео
-    frame_count = 0
+    frames = []
     while True:
         ret, frame = cap.read()
         if not ret:
             break
-        cv2.imwrite(os.path.join(output_dir, f"frame_{frame_count:08d}.jpg"),
-                    frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
-        frame_count += 1
+        frames.append(frame)
     cap.release()
-    return Response(True, None, frame_count)
+    return Response(True, None, frames)
+
 
 def extract_audio(video_path, output_audio_path):
     """
@@ -103,6 +101,8 @@ def extract_audio(video_path, output_audio_path):
         with VideoFileClip(video_path) as video:
             audio = video.audio
             audio.write_audiofile(output_audio_path)
+            # TODO: удалить временный аудиофайл после использования, если он не нужен
+            # audio.write_audiofile(f'var/data/audio/audio.mp3')
         return Response(True, None, None)
     except Exception as e:
         return Response(False, str(e), None)
