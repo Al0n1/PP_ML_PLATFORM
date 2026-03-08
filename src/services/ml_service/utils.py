@@ -1,41 +1,15 @@
 import cv2
 import os
-from moviepy import VideoFileClip
-import logging 
-logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-import os
 from PIL import Image
+import logging 
+from typing import List, Dict
+from moviepy import VideoFileClip, AudioFileClip, ImageSequenceClip
+import wave
+import contextlib
+from audiostretchy.stretch import stretch_audio
+from pydub import AudioSegment
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
-def tr_frames(frames_dir, res_dir):
-    """
-    Обрабатывает изображения в frames_dir, заполняет левую половину черным цветом,
-    и сохраняет в res_dir.
-
-    :param frames_dir: путь к папке с исходными кадрами
-    :param res_dir: путь к папке, куда сохранять обработанные кадры
-    """
-    if not os.path.exists(res_dir):
-        os.makedirs(res_dir)
-
-    for filename in os.listdir(frames_dir):
-        file_path = os.path.join(frames_dir, filename)
-        if os.path.isfile(file_path):
-            try:
-                with Image.open(file_path) as img:
-                    width, height = img.size
-                    # Создаем копию изображения, чтобы не изменять оригинал
-                    img_copy = img.copy()
-
-                    # Заполняем левую половину черным цветом
-                    draw = Image.new('RGB', (width // 2, height), (0, 0, 0))
-                    img_copy.paste(draw, (0, 0))
-
-                    save_path = os.path.join(res_dir, filename)
-                    img_copy.save(save_path)
-            except Exception as e:
-                return {'status': False, 'error': e}
-            
-    return {'status': True}
 
 def rename_file(directory, old_name, new_name):
     old_path = os.path.join(directory, old_name)
@@ -50,35 +24,6 @@ def rename_file(directory, old_name, new_name):
         return {'status': False, 'error': f"Файл с именем '{new_name}' уже существует в директории '{directory}'."}
     except Exception as e:
         return {'status': False, 'error': f"Произошла ошибка: {e}"}
-
-
-def split_video_to_frames(path: str, temp_dir: str):
-    # Создаем директорию, если она не существует
-    os.makedirs(temp_dir, exist_ok=True)
-    
-    # Загружаем видео
-    cap = cv2.VideoCapture(path)
-    
-    # Проверка успешности открытия видео
-    if not cap.isOpened():
-        # raise IOError(f"Не удалось открыть видео: {path}")
-        return {'status': False, 'error': IOError(f"Не удалось открыть видео: {path}")}
-    
-    frame_count = 0
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # Формат имени файла: frame_000001.jpg
-        frame_filename = os.path.join(temp_dir, f"frame_{frame_count:06d}.jpg")
-        cv2.imwrite(frame_filename, frame)
-        frame_count += 1
-    
-    cap.release()
-    return {'status': True, 'procced_frames': frame_count}    
-
 
 def extract_audio_from_video(video_path, output_audio_path):
     """
@@ -96,13 +41,6 @@ def extract_audio_from_video(video_path, output_audio_path):
     except Exception as e:
         return {'status': False, 'error': e}
         
-
-import os
-import logging
-from typing import List
-import cv2
-from moviepy import VideoFileClip, AudioFileClip, ImageSequenceClip
-
 
 def safe_makedirs(path: str) -> None:
     os.makedirs(path, exist_ok=True)
@@ -198,12 +136,12 @@ def images_to_video_with_audio_auto_fps(
 
     return {'status': True}
 
-import wave
-import contextlib
-from audiostretchy.stretch import stretch_audio
-from pydub import AudioSegment
 
-def change_audio_speed(input_path: str, output_path: str, desired_duration_sec: float, temp_dir: str = 'var/temp') -> None:
+
+def change_audio_speed(input_path: str,
+                       output_path: str,
+                       desired_duration_sec: float,
+                       temp_dir: str = 'var/temp') -> Dict[str, float]:
     """
     Изменяет длительность WAV-аудио без изменения высоты тона
     и обрезает результат до заданной длительности.
@@ -234,11 +172,16 @@ def change_audio_speed(input_path: str, output_path: str, desired_duration_sec: 
     # --- Сохраняем итоговый результат ---
     trimmed_audio.export(output_path, format="wav")
 
-    print(f"✅ Исходная длительность: {original_duration:.2f} сек")
-    print(f"🎯 Целевая длительность: {desired_duration_sec:.2f} сек")
-    print(f"💾 Файл сохранён: {output_path}")
-    print(f"⚙️ Коэффициент изменения времени (ratio): {ratio:.3f} "
-          f"({'замедление' if ratio > 1 else 'ускорение'})")
-    print(f"✂️ Итоговый файл обрезан до {desired_duration_sec:.2f} секунд")
+    # print(f"✅ Исходная длительность: {original_duration:.2f} сек")
+    # print(f"🎯 Целевая длительность: {desired_duration_sec:.2f} сек")
+    # print(f"💾 Файл сохранён: {output_path}")
+    # print(f"⚙️ Коэффициент изменения времени (ratio): {ratio:.3f} "
+    #       f"({'замедление' if ratio > 1 else 'ускорение'})")
+    # print(f"✂️ Итоговый файл обрезан до {desired_duration_sec:.2f} секунд")
+
+    return {'status': True,
+            'original_duration_sec': original_duration,
+            'target_duration_sec': desired_duration_sec,
+            'ratio': ratio}
 
 
