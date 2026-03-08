@@ -19,6 +19,8 @@ from src.utils.sse_messages import build_error, build_progress, build_success
 
 STREAM_LAG_WARNING_MS = 5_000
 
+logger = logging.getLogger(__name__)
+
 @contextmanager
 def log_duration(message: str | None = None, func_name: str | None = None):
 
@@ -27,14 +29,11 @@ def log_duration(message: str | None = None, func_name: str | None = None):
     # logger.info(f"⌛ {name}")
     start = perf_counter()
 
-    yield
-
-    end = perf_counter()
-    logger.info(f"⏱ {name} finished in {end - start:.4f} sec")
-
-
-
-logger = logging.getLogger(__name__)
+    try:
+        yield
+    finally:
+        end = perf_counter()
+        logger.info(f"⏱ {name} finished in {end - start:.4f} sec")
 
 STAGE_PROGRESS = {
     "copying_file": 5,
@@ -90,6 +89,20 @@ class MLService:
             self._init_models()
             
         self.temp_dir = temp_dir
+
+    def log_duration(self, message: str | None = None, func_name: str | None = None):
+        """
+        Контекстный менеджер для логирования продолжительности выполнения блока кода.
+
+        Args:
+            message (str, optional): Сообщение для логирования. Если не указано, будет использовано имя функции.
+            func_name (str, optional): Имя функции для логирования, если message не предоставлено.
+
+        Usage:
+            with ml_service.log_duration("Processing video"):
+                # код для обработки видео
+        """
+        return log_duration(message=message, func_name=func_name)
 
     def _init_models(self):
         from huggingface_hub import login
@@ -542,7 +555,6 @@ class MLService:
                 - "error" (str, optional): Сообщение об ошибке (если есть).
         """
         # Основная логика обработки файла
-
         filename = os.path.basename(path)
         name = os.path.splitext(filename)[0]
         dir_path = os.path.join(self.temp_dir, name)
@@ -551,7 +563,7 @@ class MLService:
         extract_audio_path = os.path.join(self.temp_dir, name, f'{self.audio_extract_name}.mp3')
         frames_output_dir = os.path.join(self.temp_dir, name, 'frames')
 
-        with log_duration("Предобработка"):
+        with log_duration("⏳Предобработка"):
             resp: service_utils.Response = service_utils.extract_audio(path, extract_audio_path)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
@@ -561,7 +573,7 @@ class MLService:
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)          
 
-        with log_duration("Обработка"):
+        with log_duration("⏳Обработка"):
             resp: service_utils.Response = self._audio_process(path, self.temp_dir, name)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
@@ -575,7 +587,7 @@ class MLService:
         new_audio_path = os.path.join(self.temp_dir, name, f'{self.audio_translate_name}.mp3')
         output_video_path=os.path.join(self.temp_dir, f'{name}.mp4')
 
-        with log_duration("Постобработка"):
+        with log_duration("⏳Постобработка"):
             resp:service_utils.Response = service_utils.create_video_with_new_audio(    
                 images_dir=images_dir,
                 original_video_path=original_video_path,
@@ -590,8 +602,7 @@ class MLService:
         except FileNotFoundError:
             logger.info(f"❌Директория '{dir_path}' не найдена.")
         except Exception as e:
-            logger.info(f"❌Ошибка при удалении директории: {e}")
-        
+            logger.info(f"❌Ошибка при удалении директории: {e}")        
         return service_utils.Response(True, None, None)
     
     def _audio_process(self, path, temp_dir, name):
@@ -602,36 +613,40 @@ class MLService:
 
         with log_duration("SimpleWhisper.transcribe"):
             resp: service_utils.Response = self.recognizer.transcribe(extract_audio_path)
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None)
-            transcript = resp.result
-            path = os.path.join(temp_dir, name, f"audio_text_transcript.txt")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(transcript)
+
+        if resp.status is False:
+            return service_utils.Response(False, resp.error, None)
+        transcript = resp.result
+        path = os.path.join(temp_dir, name, f"audio_text_transcript.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(transcript)
             
         with log_duration("Translator.translate"):
             resp: service_utils.Response = self.translator.translate([transcript])
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None)
-            translation = resp.result['text'][0] # берем первый элемент, так как передавали список из одного текста
-            path = os.path.join(temp_dir, name, f"audio_text_translation.txt")
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(translation) # берем первый элемент, так как передавали список из одного текста
+
+        if resp.status is False:
+            return service_utils.Response(False, resp.error, None)
+        
+        translation = resp.result['text'][0] # берем первый элемент, так как передавали список из одного текста
+        path = os.path.join(temp_dir, name, f"audio_text_translation.txt")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(translation) # берем первый элемент, так как передавали список из одного текста
 
         with log_duration("TextToSpeech.synthesize"):
             resp: service_utils.Response = self.generator.synthesize(translation, output_path=translated_wav)
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None)
+            
+        if resp.status is False:
+            return service_utils.Response(False, resp.error, None)
 
         with log_duration("wav_to_mp3"):
             resp: service_utils.Response = service_utils.wav_to_mp3(translated_wav, translated_mp3)
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None)
+            
+        if resp.status is False:
+            return service_utils.Response(False, resp.error, None)
         
         return service_utils.Response(True, None, None)
 
     def _video_process(self, path, temp_dir, name, extra_info):
-        log_duration("Video OCR and Translation")
         key_frames = extra_info.get('key_frames', [])
         total_frames = extra_info.get('total_frames', 0)
 
@@ -642,8 +657,11 @@ class MLService:
 
         chosed_images = [img for idx, img in enumerate(images) if idx in key_frames]
 
-        with log_duration("OCR"):
+        with log_duration(message="OCR"):
+            start = perf_counter()
+            logger.info(f"Processing {len(chosed_images)} key frames with OCR")
             resp: service_utils.Response = self.ocr.process(chosed_images)
+            logger.info(f"OCR processing completed in {perf_counter() - start:.4f} seconds")
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)
             results = resp.result
@@ -666,9 +684,7 @@ class MLService:
                 start=1,
             ):
                 texts = [item['text'] for item in result]
-                # logger.info(f"[frame {i}/{len(results)}] Translating {len(texts)} text(s)")
                 resp: service_utils.Response = self.translator.translate(texts)
-                # print(resp.result)
                 if isinstance(resp.result, dict) and 'text' in resp.result:
                     for item, translate in zip(result, resp.result['text']):
                         item['translation'] = translate
@@ -680,10 +696,6 @@ class MLService:
             service_utils.save_json(translated_data, os.path.join(temp_dir, name, 'video_text.json'))
 
         id_to_id = {k: i for i, k in enumerate(key_frames)}
-        print(type(translated_data))
-        indices = key_frames
-        t = total_frames
-
         results = []
         indices_ext = key_frames + [total_frames]
 
@@ -692,8 +704,6 @@ class MLService:
             for i, k in enumerate(key_frames)
             for _ in range(indices_ext[i+1] - k)
         ]
-
-        print(results, len(results))
 
         imgs = [images[id_result] for id_result in results]
         trans = [translated_data[id_to_id[id_result]] for id_result in results]
