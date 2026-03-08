@@ -10,12 +10,11 @@ from typing import AsyncIterator
 from contextlib import contextmanager
 from time import perf_counter
 
+from . import models
 from . import utils as service_utils
-from . import n_models as models
-from src.services.ml_service.translator import Translator
-from src.services.ml_service.ocr import OCR
 from src.config.services.ml_config import settings
 from src.utils.sse_messages import build_error, build_progress, build_success
+
 
 STREAM_LAG_WARNING_MS = 5_000
 
@@ -90,6 +89,8 @@ class MLService:
             
         self.temp_dir = temp_dir
 
+        self.frame_extractor = service_utils.KeyFrameExtractor(extract_type="histogram", threshold=0.1)
+
     def log_duration(self, message: str | None = None, func_name: str | None = None):
         """
         Контекстный менеджер для логирования продолжительности выполнения блока кода.
@@ -108,7 +109,7 @@ class MLService:
         from huggingface_hub import login
         login()
         with log_duration("Translator.__init__"):
-            self.translator = Translator(self.settings)
+            self.translator = models.Translator(self.settings)
             # self.translator = models.UniversalTranslator(settings.TRANSLATOR_NAME, device=settings.TRANSLATOR_DEVICE, model_type=settings.TRANSLATOR_TYPE)
         
         with log_duration("SimpleWhisper.__init__"):
@@ -119,7 +120,7 @@ class MLService:
 
         with log_duration("OCR.__init__"):
             # self.ocr = models.OCR(device=self.settings.OCR_DEVICE)
-            self.ocr = OCR(config=self.settings)
+            self.ocr = models.OCR(config=self.settings)
 
     def _progress_message(
         self,
@@ -569,16 +570,17 @@ class MLService:
                 return service_utils.Response(False, resp.error, None) 
             
             # resp: service_utils.Response = service_utils.extract_frames(path, frames_output_dir)  
-            key_frames, total_frames = service_utils.extract_key_frames(path, frames_output_dir, save_all_frames=True)
+            # key_frames, total_frames = service_utils.extract_key_frames(path, frames_output_dir, save_all_frames=True)
+            resp: service_utils.Response = self.frame_extractor.process(path, frames_output_dir)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None)          
-
+            video_data = resp.result
         with log_duration("⏳Обработка"):
             resp: service_utils.Response = self._audio_process(path, self.temp_dir, name)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
             
-            resp: service_utils.Response = self._video_process(path, self.temp_dir, name, {'key_frames': key_frames, 'total_frames': total_frames})
+            resp: service_utils.Response = self._video_process(path, self.temp_dir, name, video_data)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
 
