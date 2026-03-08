@@ -3,6 +3,7 @@ from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 from PIL import ImageFont
 import os
+from tqdm import tqdm
 from .utils import Response
 
 def get_font(font_path=None, font_size=20):
@@ -96,7 +97,14 @@ def translate_images(images, all_annotations, output_dir, font_path="arial.ttf")
     try:
         os.makedirs(output_dir, exist_ok=True)
 
-        for img_path, annotations in zip(images, all_annotations):
+        for img_path, annotations in tqdm(
+            zip(images, all_annotations),
+            total=len(images),
+            desc="Translating images",
+            unit="img",
+            ncols=100,
+            colour="blue",
+        ):
             # Имя файла для сохранения
             filename = os.path.basename(img_path)
             output_path = os.path.join(output_dir, filename)
