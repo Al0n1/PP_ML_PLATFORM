@@ -1,4 +1,4 @@
 from .translator import  Translator
-from .speech_recognition import SimpleWhisper
+from .recognizer import Recognizer
 from .ocr import OCR
 from .audio_generator import TextToSpeech
