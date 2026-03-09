@@ -79,10 +79,10 @@ class KeyFrameExtractor:
     def process(self,
                 video_path: str,
                 save_folder: str = "var/data_ocr/frames") -> Dict[str, Union[List[int], int]]:
-        resp: Response = extract_frames(video_path, save_folder)
+        resp: Response = extract_frames(video_path)
         if not resp.status:
             return Response(False, f"KeyFrameExtractor.process. {resp.error}", None)
-        frames = resp.data
+        frames = resp.result
         if self.extract_type == "histogram":
             key_frames = extract_key_frames_histogram(frames, self.threshold)
         elif self.extract_type == "diff":
@@ -92,7 +92,7 @@ class KeyFrameExtractor:
         else:
             return Response(False, f"KeyFrameExtractor.process. Unsupported extract_type: {self.extract_type}", None)
 
-        return Response(True, None, {"key_frames": key_frames, "total_frames": len(frames)})
+        return Response(True, None, {"key_frames": key_frames, "total_frames": len(frames), "frames": frames})
 
 
 if __name__ == "__main__":
