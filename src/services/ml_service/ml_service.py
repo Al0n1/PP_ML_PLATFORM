@@ -112,8 +112,8 @@ class MLService:
             self.translator = models.Translator(self.settings)
             # self.translator = models.UniversalTranslator(settings.TRANSLATOR_NAME, device=settings.TRANSLATOR_DEVICE, model_type=settings.TRANSLATOR_TYPE)
         
-        with log_duration("SimpleWhisper.__init__"):
-            self.recognizer = models.SimpleWhisper(device=self.settings.RECOGNIZER_DEVICE, model_name=self.settings.RECOGNIZER_NAME)
+        with log_duration("Recognizer.__init__"):
+            self.recognizer = models.Recognizer(settings=self.settings)
 
         with log_duration("TextToSpeech.__init__"):
             self.generator = models.TextToSpeech()
@@ -348,7 +348,7 @@ class MLService:
         # === ЭТАП 4: recognizing_speech ===
         yield self._progress_message("recognizing_speech", trace_id=trace_id)
         stage_started = perf_counter()
-        r = await self._run_blocking(self.recognizer.transcribe, extract_audio_path)
+        r = await self._run_blocking(self.recognizer.process, extract_audio_path)
         if not r.status:
             raise Exception(r.error)
         transcript = r.result
@@ -569,6 +569,8 @@ class MLService:
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
             
+            os.makedirs(frames_output_dir, exist_ok=True)
+            
             # resp: service_utils.Response = service_utils.extract_frames(path, frames_output_dir)  
             # key_frames, total_frames = service_utils.extract_key_frames(path, frames_output_dir, save_all_frames=True)
             resp: service_utils.Response = self.frame_extractor.process(path, frames_output_dir)
@@ -613,12 +615,12 @@ class MLService:
         translated_wav = os.path.join(base_dir, f"{self.audio_translate_name}.wav")
         translated_mp3 = os.path.join(base_dir, f"{self.audio_translate_name}.mp3")
 
-        with log_duration("SimpleWhisper.transcribe"):
-            resp: service_utils.Response = self.recognizer.transcribe(extract_audio_path)
+        with log_duration("Recognizer.process"):
+            resp: service_utils.Response = self.recognizer.process(extract_audio_path)
 
         if resp.status is False:
             return service_utils.Response(False, resp.error, None)
-        transcript = resp.result
+        transcript: str = resp.result.get("text", "")
         path = os.path.join(temp_dir, name, f"audio_text_transcript.txt")
         with open(path, "w", encoding="utf-8") as f:
             f.write(transcript)
@@ -648,16 +650,19 @@ class MLService:
         
         return service_utils.Response(True, None, None)
 
-    def _video_process(self, path, temp_dir, name, extra_info):
-        key_frames = extra_info.get('key_frames', [])
-        total_frames = extra_info.get('total_frames', 0)
+    def _video_process(self, path, temp_dir, name, video_data):
+        # key_frames = extra_info.get('key_frames', [])
+        # total_frames = extra_info.get('total_frames', 0)
+        frames = video_data.get('frames', [])
+        key_frames = video_data.get('key_frames', [])
+        total_frames = video_data.get('total_frames', 0)
 
         frames_dir = os.path.join(temp_dir, name, 'frames')
-        images = service_utils.get_image_paths(frames_dir)
+        # images = service_utils.get_image_paths(frames_dir)
         output_dir = os.path.join(temp_dir, name, 'frames_translated')
         ocr_out_path = os.path.join(temp_dir, name, f'ocr.json')
 
-        chosed_images = [img for idx, img in enumerate(images) if idx in key_frames]
+        chosed_images = [img for idx, img in enumerate(frames) if idx in key_frames]
 
         with log_duration(message="OCR"):
             start = perf_counter()
@@ -681,6 +686,23 @@ class MLService:
         from tqdm import tqdm
         with log_duration("Translate"):
             results = service_utils.load_json(ocr_out_path)
+            # Получаем список текстов для перевода. создаем словарь индекс к кадру для последующего сопоставления перевода с кадром
+            index_dict = {}
+            texts_for_translation = []
+            global_index = 0
+            for id_result, result in enumerate(results):
+                index_dict[id_result] = []
+                for id_item, item in enumerate(result):
+                    item['translation'] = "" # добавляем поле для перевода, чтобы сохранить структуру данных и избежать проблем с сопоставлением после перевода
+                    index_dict[id_result].append(global_index)
+                    texts_for_translation.append(item['text'])
+                    global_index += 1
+            with log_duration('Translate - API call'):
+                resp: service_utils.Response = self.translator.translate(texts_for_translation)
+                translated_texts = resp.result
+                print(f"Translated {len(translated_texts)} texts")  # Debug print
+
+
             for i, result in enumerate(
                 tqdm(results, desc="Translating OCR texts", unit="frame", ncols=100, colour="green"),
                 start=1,
@@ -707,11 +729,12 @@ class MLService:
             for _ in range(indices_ext[i+1] - k)
         ]
 
-        imgs = [images[id_result] for id_result in results]
+        # imgs = [frames[id_result] for id_result in results]
+        
         trans = [translated_data[id_to_id[id_result]] for id_result in results]
         with log_duration('Re translate'):
             resp: service_utils.Response = service_utils.translate_images(
-                imgs,
+                frames,
                 trans,
                 output_dir=output_dir,
                 font_path="arial.ttf"
