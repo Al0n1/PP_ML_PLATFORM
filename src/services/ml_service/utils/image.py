@@ -4,6 +4,8 @@ import numpy as np
 from PIL import ImageFont
 import os
 from tqdm import tqdm
+
+from typing import List, Union
 from .utils import Response
 
 def get_font(font_path=None, font_size=20):
@@ -38,17 +40,17 @@ def get_font(font_path=None, font_size=20):
 
     raise OSError("Не найден шрифт для русского текста. Укажите font_path с .ttf файлом")
 
-def draw_translations_on_image(image_path, annotations, output_path, font_path=None):
+def draw_translations_on_image(image: Image.Image, annotations, output_path, font_path=None):
     """
     Закрашивает текст на изображении и добавляет русский перевод.
 
     Args:
-        image_path (str): путь к исходному изображению
+        image (PIL.Image.Image): объект изображения PIL
         annotations (list): список словарей с 'bbox' и 'translation'
         output_path (str): путь для сохранения результата
         font_path (str, optional): путь к .ttf шрифту с поддержкой кириллицы
     """
-    img = Image.open(image_path).convert("RGB")
+    img = image.convert("RGB")
     draw = ImageDraw.Draw(img)
     img_width, img_height = img.size
 
@@ -84,12 +86,12 @@ def draw_translations_on_image(image_path, annotations, output_path, font_path=N
 
     img.save(output_path)
 
-def translate_images(images, all_annotations, output_dir, font_path="arial.ttf"):
+def translate_images(images: List[Union[np.ndarray, str]], all_annotations, output_dir, font_path="arial.ttf"):
     """
     Обрабатывает список изображений и аннотаций, добавляя русский текст поверх.
 
     Args:
-        images (list): список путей к исходным изображениям
+        images (list): список путей к исходным изображениям или numpy массивов изображений
         all_annotations (list): список списков аннотаций для каждого изображения
         output_dir (str): папка для сохранения обработанных изображений
         font_path (str): путь к .ttf шрифту, поддерживающему русский язык
@@ -97,20 +99,25 @@ def translate_images(images, all_annotations, output_dir, font_path="arial.ttf")
     try:
         os.makedirs(output_dir, exist_ok=True)
 
-        for img_path, annotations in tqdm(
+        for idx, (img_path, annotations) in enumerate(tqdm(
             zip(images, all_annotations),
             total=len(images),
             desc="Translating images",
             unit="img",
             ncols=100,
             colour="blue",
-        ):
+        )):
             # Имя файла для сохранения
-            filename = os.path.basename(img_path)
+            if isinstance(img_path, np.ndarray):
+                image = Image.fromarray(img_path)
+                filename = f"image_{idx:04d}.jpg"
+            else:
+                image = Image.open(img_path)
+                filename = os.path.basename(img_path)
             output_path = os.path.join(output_dir, filename)
 
             # Вызываем функцию для одного изображения
-            draw_translations_on_image(img_path, annotations, output_path, font_path=font_path)
+            draw_translations_on_image(image, annotations, output_path, font_path=font_path)
         return Response(True, None, None)
     except Exception as e:
         return Response(False, e, None)
