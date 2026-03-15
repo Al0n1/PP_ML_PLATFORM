@@ -1,11 +1,14 @@
 import os
 import cv2
+import logging
 import numpy as np
 from sklearn.cluster import KMeans
 from typing import List, Union, Dict
 
+from src.services.ml_service.utils.utils import Response, VideoData
+from src.services.ml_service.utils.video import extract_frames
 
-from src.services.ml_service.utils import Response, extract_frames
+logging.basicConfig(level=logging.INFO)
 
 
 def extract_key_frames_histogram(frames: List[np.ndarray],
@@ -77,12 +80,8 @@ class KeyFrameExtractor:
             return Response(False, f"KeyFrameExtractor.save_frames. {str(e)}", None)
     
     def process(self,
-                video_path: str,
-                save_folder: str = "var/data_ocr/frames") -> Dict[str, Union[List[int], int]]:
-        resp: Response = extract_frames(video_path)
-        if not resp.status:
-            return Response(False, f"KeyFrameExtractor.process. {resp.error}", None)
-        frames = resp.result
+                video_data: VideoData) -> VideoData:
+        frames = video_data.video.source_frames
         if self.extract_type == "histogram":
             key_frames = extract_key_frames_histogram(frames, self.threshold)
         elif self.extract_type == "diff":
@@ -90,15 +89,25 @@ class KeyFrameExtractor:
         elif self.extract_type == "kmeans":
             key_frames = extract_keyframes_kmeans(frames, self.threshold)   
         else:
-            return Response(False, f"KeyFrameExtractor.process. Unsupported extract_type: {self.extract_type}", None)
+            logging.error(f"KeyFrameExtractor.process. Unsupported extract_type: {self.extract_type}")
+            return video_data
 
-        return Response(True, None, {"key_frames": key_frames, "total_frames": len(frames), "frames": frames})
+        video_data.video.selected_frames = key_frames
+        idx_to_idx = {frame_idx: i for i, frame_idx in enumerate(key_frames)}
+        total_frames = len(frames)
+        indices_ext = key_frames + [total_frames]
+        results = [
+            idx_to_idx[k]
+            for i, k in enumerate(key_frames)
+            for _ in range(indices_ext[i + 1] - k)
+        ]
+        video_data.video.translated_frames_indexes = results
 
+        return video_data
 
 if __name__ == "__main__":
-    extractor = KeyFrameExtractor(threshold=0.1, extract_type="diff")
-    result = extractor.process("var/data_ocr/small_sample.mp4")
-    key_frames = result["key_frames"]
-    total_frames = result["total_frames"]
-    print("Key frame indices:", key_frames)
-    print(f"Total key frames: {len(key_frames)}, Percentage: {len(key_frames) / total_frames * 100:.2f}%")
+    extractor = KeyFrameExtractor(threshold=0.1, extract_type="histogram")
+    video_data = VideoData(source_path="var/data_ocr/small_sample.mp4")
+    video_data = extract_frames(video_data)
+    result = extractor.process(video_data)
+    

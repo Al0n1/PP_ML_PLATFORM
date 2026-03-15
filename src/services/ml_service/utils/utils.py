@@ -1,83 +1,21 @@
-import os
-import json
-from typing import Any
+import pickle
+import shutil 
+import logging
+import numpy as np
+from typing import Optional, List, Any
+from dataclasses import dataclass, field
 
-def extract_name(path):
-    basename = os.path.basename(path)
-    filename = os.path.splitext(basename)[0]
-    return filename
+logger = logging.getLogger(__name__)
 
-def unique_indices(data):
-    seen = set()
-    unique_idxs = []
 
-    for i, item in enumerate(data):
-        key = json.dumps(item, sort_keys=True)
-        if key not in seen:
-            seen.add(key)
-            unique_idxs.append(i)
-    
-    return unique_idxs
-
-def fill_with_unique(data):
-    seen = set()
-    lst = []
-    for i, item in enumerate(data):
-        key = json.dumps(item, sort_keys=True)
-        if key not in seen:
-            seen.add(key)
-            lst.append(i)
-        else:
-            lst.append(lst[-1])
-    
-    return lst
-    
-def get_image_paths(frames_dir):
-    return [
-        os.path.join(frames_dir, img)
-        for img in os.listdir(frames_dir)
-        if img.endswith(".jpg")
-    ]
-
-def load_json(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def save_json(data, path):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=4)
-
-def translate_ocr_results(translator, data):
-    # карта уникальных страниц (длина == data)
-    unique_map = fill_with_unique(data)
-    #TODO: Реализовать более эффективный способ получения уникальных текстов для перевода, чтобы не переводить дубликаты. Сейчас мы просто переводим все, а потом копируем переводы в дубликаты. Это может быть неэффективно при большом количестве страниц с одинаковым текстом.
-    unique_idxs = sorted(set(unique_map))
-
-    texts = []
-    for idx in unique_idxs:
-        for item in data[idx]:
-            texts.append(item["text"])
-
-    # 2. Переводим
-    resp: Response = translator.translate(texts)
-    if resp.status is False:
-        return resp
-    translations = resp.result
-
-    # 3. Назначаем переводы уникальным страницам
-    t_idx = 0
-    for idx in unique_idxs:
-        for item in data[idx]:
-            item["translation"] = translations[t_idx]
-            t_idx += 1
-
-    # 4. Копируем текст в дубликаты
-    for i, page in enumerate(data):
-        original_idx = unique_map[i]
-        for item, orig_item in zip(page, data[original_idx]):
-            item["translation"] = orig_item["translation"]
-
-    return Response(True, None, data)
+def delete_temp_directory(temp_directory_path: str):
+    try:
+        shutil.rmtree(temp_directory_path)
+        logger.info(f"✅Директория '{temp_directory_path}' успешно удалена.")
+    except FileNotFoundError:
+        logger.info(f"❌Директория '{temp_directory_path}' не найдена.")
+    except Exception as e:
+        logger.info(f"❌Ошибка при удалении директории: {e}")    
 
 
 
@@ -86,3 +24,76 @@ class Response:
         self.status = status
         self.error = error
         self.result = result
+
+@dataclass
+class BoundingBox:
+    x_min: float
+    y_min: float
+    x_max: float
+    y_max: float
+
+@dataclass
+class TextItem:
+    text: Optional[str] = None
+    translation: Optional[str] = None
+    bounding_box: Optional[BoundingBox] = None
+
+@dataclass
+class Frame:
+    texts: Optional[List[TextItem]] = None
+
+    bounding_boxes: Optional[List[BoundingBox]] = None
+    source_texts: Optional[List[str]] = None
+    translated_texts: Optional[List[str]] = None
+
+@dataclass
+class Video:
+    source_frames: Optional[List[np.ndarray]] = None
+    selected_frames: Optional[List[int]] = None
+    ocr_frames: Optional[List[Frame]] = None
+    translated_frames: bool = False
+    translated_frames_indexes: Optional[List[int]] = None
+
+@dataclass
+class Audio:
+    source_audio_path: Optional[str] = None
+    source_text: Optional[str] = None
+    translated_text: Optional[str] = None
+    output_audio_path: Optional[str] = None
+
+@dataclass
+class VideoData:
+    # Base
+    source_path: Optional[str] = None
+    video_name: Optional[str] = None
+    source_language: Optional[str] = None
+    target_language: Optional[str] = None
+    output_dir: Optional[str] = None
+    temp_dir: Optional[str] = None
+    # Audio
+    audio: Audio = field(default_factory=Audio)
+    # Video
+    video: Video = field(default_factory=Video)
+
+
+def save_video_data(video_data: 'VideoData', path: str):
+    try:
+        with open(path, 'wb') as f:
+            pickle.dump(video_data, f)
+        logger.info(f"✅VideoData успешно сохранены в '{path}'.")
+    except Exception as e:
+        logger.error(f"❌Ошибка при сохранении VideoData: {e}")
+
+def load_video_data(path: str) -> VideoData:
+    with open(path, 'rb') as f:
+        video_data = pickle.load(f)
+    return video_data
+        
+
+
+if __name__ == '__main__':
+    vd = VideoData()
+    
+
+    
+    

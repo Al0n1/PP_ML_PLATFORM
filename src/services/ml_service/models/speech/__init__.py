@@ -1,0 +1,1 @@
+from .vits_model import VitsAudioGenerationModel

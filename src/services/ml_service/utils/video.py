@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import os
-from .utils import Response
+from .utils import Response, VideoData
 # try:
 #     from moviepy.editor import ImageSequenceClip, AudioFileClip, VideoFileClip, VideoClip
 # except ImportError:
@@ -12,73 +12,13 @@ except ImportError:
     print("moviepy is not installed. Audio extraction will not work.")
 
 
-def extract_key_frames(
-    video_path: str,
-    save_folder: str = "var/data_ocr/frames",
-    threshold: float = 1.0,
-    save_key_frames: bool = False,
-    save_all_frames: bool = False,
-) -> tuple[list[int], int]:
-    """Извлекает ключевые кадры из видео на основе попиксельной разницы.
-
-    Args:
-        video_path: Путь к видеофайлу.
-        save_folder: Папка для сохранения кадров.
-        threshold: Порог средней попиксельной разницы для определения ключевого кадра.
-        save_key_frames: Сохранять только ключевые кадры в save_folder.
-        save_all_frames: Сохранять все кадры в save_folder.
-
-    Returns:
-        Кортеж (список индексов ключевых кадров, общее количество кадров).
-    """
-    os.makedirs(save_folder, exist_ok=True)
-    cap = cv2.VideoCapture(video_path)
-
-    key_frames: list[int] = []
-
-    ret, prev_frame = cap.read()
-    if not ret:
-        cap.release()
-        return [], 0
-
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-
-    frame_idx = 1
-    key_frames.append(1)  # Добавляем первый кадр как ключевой
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        if save_all_frames:
-            cv2.imwrite(f"{save_folder}/frame_{frame_idx:06d}.jpg", frame)
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        diff = cv2.absdiff(gray, prev_gray)
-        score = np.mean(diff)
-        if score > threshold:
-            key_frames.append(frame_idx)
-
-            if save_key_frames and not save_all_frames:
-                cv2.imwrite(f"{save_folder}/frame_{frame_idx:06d}.jpg", frame)
-
-        prev_gray = gray
-        frame_idx += 1
-
-    cap.release()
-    return key_frames, frame_idx
-
-
-
-def extract_frames(video_path: str) -> Response:
-    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+def extract_frames(video_data: VideoData) -> VideoData:
+    cap = cv2.VideoCapture(video_data.source_path, cv2.CAP_FFMPEG)
     if not cap.isOpened():
         # Попытка открыть снова без указания backend
-        cap = cv2.VideoCapture(video_path)
+        cap = cv2.VideoCapture(video_data.source_path)
         if not cap.isOpened():
-            return Response(False,'Не удалось открыть видеофайл', None)
+            return video_data
     # Успешное открытие видео
     frames = []
     while True:
@@ -87,7 +27,8 @@ def extract_frames(video_path: str) -> Response:
             break
         frames.append(frame)
     cap.release()
-    return Response(True, None, frames)
+    video_data.video.source_frames = frames
+    return video_data
 
 
 def extract_audio(video_path, output_audio_path):
@@ -108,27 +49,25 @@ def extract_audio(video_path, output_audio_path):
         return Response(False, str(e), None)
         
 
-def create_video_with_new_audio(images_dir, original_video_path, new_audio_path, output_video_path):
+def create_video_with_new_audio(video_data: VideoData) -> Response:
     """
     Создает новое видео из изображений и нового аудио.
     """
     try:
-        image_files = sorted([
-            os.path.join(images_dir, f)
-            for f in os.listdir(images_dir)
-            if f.lower().endswith((".png", ".jpg", ".jpeg"))
-        ])
-        if not image_files:
-            raise ValueError("В указанной папке нет изображений")
-
+        output_video_path = os.path.join(video_data.temp_dir, f'{video_data.video_name}.mp4')
+        original_video_path = video_data.source_path
+        new_audio_path = video_data.audio.output_audio_path
+        count_frames = len(video_data.video.source_frames)
         with VideoFileClip(original_video_path) as orig_video, AudioFileClip(new_audio_path) as audio_clip:
             video_size = orig_video.size
             audio_duration = audio_clip.duration
-            frame_duration = audio_duration / len(image_files)
-            video_clip = ImageSequenceClip(image_files, durations=[frame_duration]*len(image_files))
+            frame_duration = audio_duration / count_frames
+            # video_clip = ImageSequenceClip(image_files, durations=[frame_duration]*len(image_files))
+            video_clip: ImageSequenceClip = ImageSequenceClip(video_data.video.source_frames,
+                                           durations=[frame_duration]*count_frames)
             video_clip = video_clip.resized(new_size=video_size)
             video_clip = video_clip.with_audio(audio_clip)
             video_clip.write_videofile(output_video_path, codec="libx264", audio_codec="aac")
         return Response(True, None, None)
     except Exception as e:
-        return Response(False, None, None)
+        return Response(False, str(e), None)

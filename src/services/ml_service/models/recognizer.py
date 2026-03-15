@@ -2,11 +2,11 @@ from typing import Union, Any
 
 from src.config.services.ml_config import settings, Settings
 from src.services.ml_service.models.recognizers.base import BaseRecognizer
-from .recognizers.openai_whisper import WhisperSpeechRecognitionModel
-from ..utils import Response 
+from .recognizers.openai_whisper import WhisperSpeechRecognitionModel, whisper
+from ..utils import Response, VideoData
 
 MODELS = {
-    'whisper': ['tiny', 'base', 'small', 'medium', 'large']
+    'whisper': whisper.available_models(),
 }
 
 class Recognizer(BaseRecognizer):
@@ -20,8 +20,6 @@ class Recognizer(BaseRecognizer):
             self.model = WhisperSpeechRecognitionModel(model_name=self.settings.RECOGNIZER_NAME, cache_dir=self.settings.MODEL_CACHE_DIR)
         
     
-    def process(self, data: Union[str, Any]) -> Response:
-        result = self.model.process(data)
-        if isinstance(result, str):  # если результат - строка, значит произошла ошибка
-            return Response(False, result, None)
-        return Response(True, None, result)
+    def process(self, video_data: VideoData) -> VideoData:
+        video_data = self.model.process(video_data)
+        return video_data

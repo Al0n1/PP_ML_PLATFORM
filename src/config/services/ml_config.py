@@ -19,6 +19,12 @@ class Settings(BaseSettings):
     FFMPEG_BINARY: str = ""
     FFPROBE_BINARY: str = ""
 
+    # ====Speech synthesis =====
+    # GENERATOR_TYPE: str = "glazzova/fastspeech2_ru"
+    GENERATOR_TYPE: str = "vits"
+    GENERATOR_NAME: str = "facebook/mms-tts-rus"
+    GENERATOR_DEVICE: str = "cpu"
+
     # ===== Translator =====
     TRANSLATOR_NAME: str = "glazzova/translation_en_ru"
     TRANSLATOR_TYPE: str = "marian"

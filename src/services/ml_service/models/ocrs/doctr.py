@@ -4,26 +4,31 @@ import numpy as np
 import torch
 import json
 from tqdm import tqdm
+import logging
 
 from doctr.io import DocumentFile, Document
 from doctr.models import ocr_predictor
 from src.services.ml_service.models.ocrs.base import BaseOCR
+from ...utils import VideoData, Response, Video, Frame, TextItem, BoundingBox
+
+logger = logging.getLogger(__name__)
 
 
-def ocr_to_dict(result: Document) -> List[Dict[str, Union[str, List[float]]]]:
-    data = []
+def ocr_to_dict(result: Document, video_data: VideoData) -> VideoData:
+    frames = []
     for page in tqdm(result.pages, desc="OCR parsing pages", unit="page", ncols=100, colour="cyan"):
-        page_data = []
+        text_items = []
         for block in page.blocks:
             for line in block.lines:
                 text = ' '.join(word.value for word in line.words)
                 (x_min, y_min), (x_max, y_max) = line.geometry
-                page_data.append({
-                    "text": text,
-                    "bbox": [x_min, y_min, x_max, y_max]
-                })
-        data.append(page_data)
-    return data
+                text_items.append(TextItem(
+                    text=text,
+                    bounding_box=BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max),
+                ))
+        frames.append(Frame(texts=text_items))
+    video_data.video.ocr_frames = frames
+    return video_data
 
 
 class DOCTR(BaseOCR):
@@ -37,12 +42,14 @@ class DOCTR(BaseOCR):
                                    pretrained=True).to(self.device)
         self.model.eval()  # отключаем обучение
 
-    def process(self, images: List[Union[str, Image.Image, np.ndarray]]):
+    def process(self, video_data: VideoData) -> VideoData:
         """Обработка одного изображения в документ."""
         try:
+            images = [video_data.video.source_frames[idx] for idx in video_data.video.selected_frames]
             doc = DocumentFile.from_images(images)
             result = self.model(doc)
-            return ocr_to_dict(result)
+            return ocr_to_dict(result, video_data)
         except Exception as e:
-            return str(e)
+            logger.error(f"OCR:{self.name} processing error: {e}")  
+            return video_data
         

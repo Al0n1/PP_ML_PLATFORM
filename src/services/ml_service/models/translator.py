@@ -3,7 +3,7 @@ from typing import List
 from src.config.services.ml_config import settings, Settings
 from .translators.marian import OpusTextTranslationModel
 from .translators.qwen import QwenTextTranslationModel
-from ..utils import Response 
+from ..utils import VideoData 
 
 models = {
     'marian': ['Helsinki-NLP/opus-mt-en-ru', 'glazzova/translation_en_ru'],
@@ -25,13 +25,13 @@ class Translator:
         else:
             raise ValueError(f"Unsupported translator type: {self.config.TRANSLATOR_TYPE}")
 
-    def translate(self, texts: List[str], image=None) -> Response:
+    def process(self, video_data: VideoData) -> VideoData:
         # Функция для перевода текста. В данном случае она просто возвращает входные данные без изменений.
         # Имеется два варианта использования:
         # 1. Если передан только текст, то он будет переведен.
         # 2. Если будет передано изображение, то модель возьмет его как дополнительный контекст для перевода.
         # Ограничения: если модель не использует изображения, то второй вариант работать не будет.
 
-        result = self.model.translate(texts, image=image)
-        return Response(True, None, result)
+        result = self.model.process(video_data)
+        return result
     

@@ -8,6 +8,7 @@ from typing import List
 
 from .base import BaseTranslationModel
 from src.config.services.ml_config import settings
+from ...utils import VideoData
 
 logger = logging.getLogger(__name__)
 
@@ -175,3 +176,36 @@ class OpusTextTranslationModel(BaseTranslationModel):
             logger.error(f"Translation error: {e}")
             return {'status': False, 'error': str(e), 'source_text': texts}
 
+    def _process_audio(self, video_data: VideoData) -> VideoData:
+        if isinstance(video_data.audio.source_text, str):
+            texts = [video_data.audio.source_text]
+            translation_result = self.translate(texts)
+            video_data.audio.translated_text = translation_result.get('text', [None])[0] if translation_result['status'] else None
+        return video_data
+    
+    def _process_video(self, video_data: VideoData) -> VideoData:
+        if video_data.video.translated_frames or video_data.video.ocr_frames is None:
+            return video_data
+
+        # Собираем все тексты из всех кадров в один плоский список
+        all_texts = []
+        index_map = []  # (frame_idx, text_idx) для обратного маппинга
+        for f_idx, frame in enumerate(video_data.video.ocr_frames):
+            if frame.texts:
+                for t_idx, item in enumerate(frame.texts):
+                    if item.text:
+                        all_texts.append(item.text)
+                        index_map.append((f_idx, t_idx))
+
+        if not all_texts:
+            return video_data
+
+        resp = self.translate(all_texts)
+        if resp['status']:
+            for (f_idx, t_idx), translated in zip(index_map, resp['text']):
+                video_data.video.ocr_frames[f_idx].texts[t_idx].translation = translated
+            video_data.video.translated_frames = True
+        else:
+            logger.error(f"OCR translation failed: {resp['error']}")
+
+        return video_data

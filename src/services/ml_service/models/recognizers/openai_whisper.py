@@ -6,6 +6,7 @@ from typing import Union, Any
 
 from src.config.services.ml_config import settings, Settings
 from .base import BaseRecognizer
+from ...utils import VideoData
 
 
 class WhisperSpeechRecognitionModel(BaseRecognizer):
@@ -15,12 +16,10 @@ class WhisperSpeechRecognitionModel(BaseRecognizer):
         
         self.license = 'MIT'
 
-    def process(self, path: Union[str, Any]) -> dict|str:
-        try:
-            result = self.model.transcribe(path)
-            return result
-        except Exception as e:
-            return str(e)
+    def process(self, video_data: VideoData) -> VideoData:
+        result = self.model.transcribe(video_data.source_path)
+        video_data.audio.source_text = result.get("text", None)
+        return video_data
 
 
 # SAMPLE_RATE = 16000

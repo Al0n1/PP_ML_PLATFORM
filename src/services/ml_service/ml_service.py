@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterator
 from contextlib import contextmanager
 from time import perf_counter
+from huggingface_hub import login
 
 from . import models
 from . import utils as service_utils
@@ -35,13 +36,11 @@ def log_duration(message: str | None = None, func_name: str | None = None):
         logger.info(f"⏱ {name} finished in {end - start:.4f} sec")
 
 STAGE_PROGRESS = {
-    "copying_file": 5,
-    "splitting_frames": 10,
-    "extracting_audio": 25,
-    "recognizing_speech": 40,
-    "translating_text": 55,
-    "generating_tts": 70,
-    "processing_frames": 85,
+    "splitting_frames": 2,
+    "recognizing_speech": 5,
+    "translating_text": 8,
+    "generating_tts": 12,
+    "processing_frames": 15,
     "assembling_video": 95,
 }
 
@@ -91,35 +90,22 @@ class MLService:
 
         self.frame_extractor = service_utils.KeyFrameExtractor(extract_type="histogram", threshold=0.1)
 
-    def log_duration(self, message: str | None = None, func_name: str | None = None):
-        """
-        Контекстный менеджер для логирования продолжительности выполнения блока кода.
-
-        Args:
-            message (str, optional): Сообщение для логирования. Если не указано, будет использовано имя функции.
-            func_name (str, optional): Имя функции для логирования, если message не предоставлено.
-
-        Usage:
-            with ml_service.log_duration("Processing video"):
-                # код для обработки видео
-        """
-        return log_duration(message=message, func_name=func_name)
-
     def _init_models(self):
-        from huggingface_hub import login
-        login()
+        # Если требуется аутентификация для загрузки моделей, можно использовать токен из переменных окружения
+        token = os.environ.get("HF_TOKEN")
+        if token:
+            login(token=token)
+
         with log_duration("Translator.__init__"):
             self.translator = models.Translator(self.settings)
-            # self.translator = models.UniversalTranslator(settings.TRANSLATOR_NAME, device=settings.TRANSLATOR_DEVICE, model_type=settings.TRANSLATOR_TYPE)
         
         with log_duration("Recognizer.__init__"):
             self.recognizer = models.Recognizer(settings=self.settings)
 
         with log_duration("TextToSpeech.__init__"):
-            self.generator = models.TextToSpeech()
+            self.generator = models.SpeechModel(config=self.settings)
 
         with log_duration("OCR.__init__"):
-            # self.ocr = models.OCR(device=self.settings.OCR_DEVICE)
             self.ocr = models.OCR(config=self.settings)
 
     def _progress_message(
@@ -172,19 +158,24 @@ class MLService:
         logger.info(f"MLService.execute called with data: {data}")
         payload = data.get("data", data)
         path = payload.get("path", "")
+        target_language = payload.get("target_language", "ru")
 
         if not path:
             logger.info("Video path is missing")
             return {"status": "error", "message": "Path missing"}
-
         filename = os.path.basename(path)
         name = os.path.splitext(filename)[0]
         dir_path = os.path.join(self.temp_dir, name)
         os.makedirs(dir_path, exist_ok=True)
+        video_data = service_utils.VideoData(source_path=path,
+                                             target_language=target_language,
+                                             video_name=name,
+                                             output_dir=self.temp_dir,
+                                             temp_dir=dir_path)
 
         # Запуск пайплайна обработки видео
         with log_duration(f'Обработка видео {name}'):
-            resp: service_utils.Response = self.__process_video(path, name, dir_path)
+            resp: service_utils.Response = self.__process_video(video_data)
 
         if resp.status is False:
             return {"status": "error", "message": str(resp.error)}
@@ -197,27 +188,22 @@ class MLService:
     async def execute_stream(self, data: dict) -> AsyncIterator[dict]:
         """
         Streaming версия execute() для SSE.
+        Использует тот же пайплайн на основе VideoData, что и execute(),
+        но отдаёт прогресс по SSE между этапами.
         """
         dir_path = None
         payload = data.get("data", data)
         trace_id = self._extract_trace_id(payload)
+
         try:
             path = payload.get("path", "")
+            target_language = payload.get("target_language", "ru")
+
             if not path:
-                error_message = build_error(
+                yield build_error(
                     code="ML_PROCESSING_FAILED",
                     message="Path missing",
                     stage_failed="validation",
-                )
-                self._log_message_created(trace_id, error_message)
-                self._log_yield_boundary(trace_id, "before_stream_yield", error_message)
-                yield_started = perf_counter()
-                yield error_message
-                self._log_yield_boundary(
-                    trace_id,
-                    "after_stream_resume",
-                    error_message,
-                    resume_gap_ms=int((perf_counter() - yield_started) * 1000),
                 )
                 return
 
@@ -226,56 +212,87 @@ class MLService:
             dir_path = os.path.join(self.temp_dir, name)
             os.makedirs(dir_path, exist_ok=True)
 
-            logger.info(
-                "[trace=%s] ml.execute_stream.start input_path=%s workspace=%s",
-                trace_id,
-                path,
-                dir_path,
+            video_data = service_utils.VideoData(
+                source_path=path,
+                target_language=target_language,
+                video_name=name,
+                output_dir=self.temp_dir,
             )
 
-            # Основной streaming-пайплайн
-            async for msg in self.__process_video_stream(path, name, dir_path, trace_id=trace_id):
-                self._log_yield_boundary(trace_id, "before_stream_yield", msg)
-                yield_started = perf_counter()
-                yield msg
-                self._log_yield_boundary(
-                    trace_id,
-                    "after_stream_resume",
-                    msg,
-                    resume_gap_ms=int((perf_counter() - yield_started) * 1000),
-                )
+            logger.info("[trace=%s] ml.execute_stream.start path=%s", trace_id, path)
 
-            # Успешное завершение
-            success_message = build_success(
-                result={"output": f"{name}.mp4"}
+            # === splitting_frames ===
+            yield self._progress_message("splitting_frames", trace_id=trace_id)
+            video_data = await self._run_blocking(service_utils.extract_frames, video_data)
+            video_data = await self._run_blocking(self.frame_extractor.process, video_data)
+
+            # === Audio pipeline ===
+            # recognizing_speech
+            yield self._progress_message("recognizing_speech", trace_id=trace_id)
+            video_data = await self._run_blocking(self.recognizer.process, video_data)
+
+            # translating_text (audio)
+            yield self._progress_message("translating_text", trace_id=trace_id)
+            video_data = await self._run_blocking(self.translator.process, video_data)
+
+            # generating_tts
+            yield self._progress_message("generating_tts", trace_id=trace_id)
+            video_data = await self._run_blocking(self.generator.process, video_data)
+            resp = await self._run_blocking(
+                service_utils.wav_to_mp3,
+                video_data.audio.output_audio_path,
+                video_data.audio.output_audio_path.replace('.wav', '.mp3'),
             )
-            self._log_message_created(trace_id, success_message)
-            self._log_yield_boundary(trace_id, "before_stream_yield", success_message)
-            yield_started = perf_counter()
-            yield success_message
-            self._log_yield_boundary(
-                trace_id,
-                "after_stream_resume",
-                success_message,
-                resume_gap_ms=int((perf_counter() - yield_started) * 1000),
+            if not resp.status:
+                raise Exception(resp.error)
+
+            # === Video pipeline ===
+            # processing_frames: OCR → translate → render
+            yield self._progress_message("processing_frames", trace_id=trace_id)
+            video_data = await self._run_blocking(self.ocr.process, video_data)
+            video_data = await self._run_blocking(self.translator.process, video_data)
+
+            annotations = [
+                video_data.video.ocr_frames[idx]
+                for idx in video_data.video.translated_frames_indexes
+            ]
+            resp = await self._run_blocking(
+                service_utils.translate_images,
+                video_data.video.source_frames,
+                annotations,
+                output_dir=os.path.join(self.temp_dir, video_data.video_name),
+                font_path="arial.ttf",
             )
+            if not resp.status:
+                raise Exception(resp.error)
+
+            # === assembling_video ===
+            yield self._progress_message("assembling_video", trace_id=trace_id)
+            images_dir = os.path.join(self.temp_dir, video_data.video_name, 'frames_translated')
+            new_audio_path = os.path.join(
+                self.temp_dir, video_data.video_name, f'{self.audio_translate_name}.mp3'
+            )
+            output_video_path = os.path.join(self.temp_dir, f'{video_data.video_name}.mp4')
+
+            resp = await self._run_blocking(
+                service_utils.create_video_with_new_audio,
+                images_dir=images_dir,
+                original_video_path=video_data.source_path,
+                new_audio_path=new_audio_path,
+                output_video_path=output_video_path,
+            )
+            if not resp.status:
+                raise Exception(resp.error)
+
+            logger.info("[trace=%s] ml.pipeline.complete output=%s", trace_id, output_video_path)
+            yield build_success(result={"output": f"{name}.mp4"})
 
         except Exception as e:
             logger.exception("[trace=%s] ❌ Ошибка в execute_stream", trace_id)
-            error_message = build_error(
+            yield build_error(
                 code="ML_PROCESSING_FAILED",
                 message=str(e),
                 stage_failed="ml_processing",
-            )
-            self._log_message_created(trace_id, error_message)
-            self._log_yield_boundary(trace_id, "before_stream_yield", error_message)
-            yield_started = perf_counter()
-            yield error_message
-            self._log_yield_boundary(
-                trace_id,
-                "after_stream_resume",
-                error_message,
-                resume_gap_ms=int((perf_counter() - yield_started) * 1000),
             )
         finally:
             if dir_path and os.path.isdir(dir_path):
@@ -285,191 +302,8 @@ class MLService:
                 except Exception:
                     logger.warning(
                         "[trace=%s] Failed to cleanup ML workspace: %s",
-                        trace_id,
-                        dir_path,
-                        exc_info=True,
+                        trace_id, dir_path, exc_info=True,
                     )
-
-    async def __process_video_stream(self, path: str, name: str, result_dir: str, trace_id: str):
-        """
-        Streaming версия обработки видео с прогрессом.
-        """
-
-        base_dir = os.path.join(self.temp_dir, name)
-        extract_audio_path = os.path.join(base_dir, f'{self.audio_extract_name}.mp3')
-        frames_output_dir = os.path.join(base_dir, 'frames')
-        logger.info(
-            "[trace=%s] ml.pipeline.start base_dir=%s source_path=%s",
-            trace_id,
-            base_dir,
-            path,
-        )
-
-        # === ЭТАП 1: copying_file ===
-        yield self._progress_message("copying_file", trace_id=trace_id)
-        stage_started = perf_counter()
-        await self._run_blocking(shutil.copy, path, base_dir)
-        logger.info(
-            "[trace=%s] ml.stage.done stage=copying_file duration_ms=%s destination=%s",
-            trace_id,
-            int((perf_counter() - stage_started) * 1000),
-            base_dir,
-        )
-
-        # === ЭТАП 2: splitting_frames ===
-        yield self._progress_message("splitting_frames", trace_id=trace_id)
-        stage_started = perf_counter()
-        r = await self._run_blocking(service_utils.extract_frames, path, frames_output_dir)
-        if not r.status:
-            raise Exception(r.error)
-
-        images = await self._run_blocking(service_utils.get_image_paths, frames_output_dir)
-        logger.info(
-            "[trace=%s] ml.stage.done stage=splitting_frames duration_ms=%s frames=%s output_dir=%s",
-            trace_id,
-            int((perf_counter() - stage_started) * 1000),
-            len(images),
-            frames_output_dir,
-        )
-
-        # === ЭТАП 3: extracting_audio ===
-        yield self._progress_message("extracting_audio", trace_id=trace_id)
-        stage_started = perf_counter()
-        r = await self._run_blocking(service_utils.extract_audio, path, extract_audio_path)
-        if not r.status:
-            raise Exception(r.error)
-        logger.info(
-            "[trace=%s] ml.stage.done stage=extracting_audio duration_ms=%s audio_path=%s",
-            trace_id,
-            int((perf_counter() - stage_started) * 1000),
-            extract_audio_path,
-        )
-
-        # === ЭТАП 4: recognizing_speech ===
-        yield self._progress_message("recognizing_speech", trace_id=trace_id)
-        stage_started = perf_counter()
-        r = await self._run_blocking(self.recognizer.process, extract_audio_path)
-        if not r.status:
-            raise Exception(r.error)
-        transcript = r.result
-        logger.info(
-            "[trace=%s] ml.stage.done stage=recognizing_speech duration_ms=%s transcript_chars=%s",
-            trace_id,
-            int((perf_counter() - stage_started) * 1000),
-            len(transcript or ""),
-        )
-
-        # === ЭТАП 5: translating_text ===
-        yield self._progress_message("translating_text", trace_id=trace_id)
-        stage_started = perf_counter()
-        r = await self._run_blocking(self.translator.translate, transcript)
-        if not r.status:
-            raise Exception(r.error)
-        translation = r.result
-        logger.info(
-            "[trace=%s] ml.stage.done stage=translating_text duration_ms=%s translation_chars=%s",
-            trace_id,
-            int((perf_counter() - stage_started) * 1000),
-            len(translation or ""),
-        )
-
-        # === ЭТАП 6: generating_tts ===
-        yield self._progress_message("generating_tts", trace_id=trace_id)
-        wav_path = os.path.join(base_dir, f'{self.audio_translate_name}.wav')
-        mp3_path = os.path.join(base_dir, f'{self.audio_translate_name}.mp3')
-
-        stage_started = perf_counter()
-        r = await self._run_blocking(self.generator.synthesize, translation, output_path=wav_path)
-        if not r.status:
-            raise Exception(r.error)
-
-        r = await self._run_blocking(service_utils.wav_to_mp3, wav_path, mp3_path)
-        if not r.status:
-            raise Exception(r.error)
-        logger.info(
-            "[trace=%s] ml.stage.done stage=generating_tts duration_ms=%s wav_path=%s mp3_path=%s",
-            trace_id,
-            int((perf_counter() - stage_started) * 1000),
-            wav_path,
-            mp3_path,
-        )
-
-        # === ЭТАП 7: processing_frames (С ПОДЭТАПАМИ) ===
-        total_images = len(images)
-        yield self._progress_message("processing_frames", trace_id=trace_id)
-        logger.info("[trace=%s] ml.stage.start stage=processing_frames total_images=%s", trace_id, total_images)
-
-        stage_started = perf_counter()
-        ocr_response = await self._run_blocking(self.ocr.process, images)
-        if not ocr_response.status:
-            raise Exception(ocr_response.error)
-        ocr_results = ocr_response.result
-        # ocr_results = await self._run_blocking(self.ocr.ocr_to_dict, ocr_raw)
-        translated_response = await self._run_blocking(
-            service_utils.translate_ocr_results,
-            self.translator, ocr_results
-        )
-        if not translated_response.status:
-            raise Exception(translated_response.error)
-        translated = translated_response.result
-
-        out_dir = os.path.join(base_dir, "frames_translated")
-        os.makedirs(out_dir, exist_ok=True)
-        logger.info(
-            "[trace=%s] ml.processing_frames.prepare_done duration_ms=%s ocr_items=%s translated_items=%s output_dir=%s",
-            trace_id,
-            int((perf_counter() - stage_started) * 1000),
-            len(ocr_results),
-            len(translated),
-            out_dir,
-        )
-
-        for index, img in enumerate(images, start=1):
-            image_started = perf_counter()
-            image_response = await self._run_blocking(
-                service_utils.translate_images,
-                [img],
-                translated[index - 1:index],
-                output_dir=out_dir,
-                font_path="arial.ttf",
-            )
-            if not image_response.status:
-                raise Exception(image_response.error)
-            yield self._progress_message(
-                "processing_frames",
-                current_step=index,
-                total_steps=total_images,
-                trace_id=trace_id,
-            )
-            if index == 1 or index == total_images or index % 25 == 0:
-                logger.info(
-                    "[trace=%s] ml.processing_frames.step index=%s total=%s duration_ms=%s image=%s",
-                    trace_id,
-                    index,
-                    total_images,
-                    int((perf_counter() - image_started) * 1000),
-                    img,
-                )
-
-        # === ЭТАП 8: assembling_video ===
-        yield self._progress_message("assembling_video", trace_id=trace_id)
-        stage_started = perf_counter()
-        r = await self._run_blocking(
-            service_utils.create_video_with_new_audio,
-            images_dir=out_dir,
-            original_video_path=path,
-            new_audio_path=mp3_path,
-            output_video_path=os.path.join(self.temp_dir, f"{name}.mp4"),
-        )
-        if not r.status:
-            raise Exception(r.error)
-        logger.info(
-            "[trace=%s] ml.stage.done stage=assembling_video duration_ms=%s output=%s",
-            trace_id,
-            int((perf_counter() - stage_started) * 1000),
-            os.path.join(self.temp_dir, f"{name}.mp4"),
-        )
-        logger.info("[trace=%s] ml.pipeline.complete output=%s", trace_id, os.path.join(self.temp_dir, f"{name}.mp4"))
 
     @staticmethod
     def _extract_trace_id(payload: dict) -> str:
@@ -530,8 +364,7 @@ class MLService:
             message.get("details"),
         )
 
-
-    def __process_video(self, path: str, name: str, result_dir: str) -> dict:
+    def __process_video(self, video_data: service_utils.VideoData) -> dict:
         """
         Проводит весь цикл обработки видео: извлечение, преобразование и сборка результата.
 
@@ -546,214 +379,59 @@ class MLService:
             8. Сборка нового видео с синхронизацией аудио.
 
         Args:
-            path (str): Путь к исходному видеофайлу.
-            name (str): Имя видео (используется как префикс временных файлов).
-            result_dir (str): Путь к директории для сохранения результатов.
+            video_data (service_utils.VideoData): Объект с данными видео.
 
         Returns:
             dict: Словарь с результатом выполнения:
                 - "status" (bool): Успешность операции.
                 - "error" (str, optional): Сообщение об ошибке (если есть).
         """
-        # Основная логика обработки файла
-        filename = os.path.basename(path)
-        name = os.path.splitext(filename)[0]
-        dir_path = os.path.join(self.temp_dir, name)
-        os.makedirs(dir_path, exist_ok=True)
-
-        extract_audio_path = os.path.join(self.temp_dir, name, f'{self.audio_extract_name}.mp3')
-        frames_output_dir = os.path.join(self.temp_dir, name, 'frames')
-
-        with log_duration("⏳Предобработка"):
-            resp: service_utils.Response = service_utils.extract_audio(path, extract_audio_path)
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None) 
-            
-            os.makedirs(frames_output_dir, exist_ok=True)
-            
-            # resp: service_utils.Response = service_utils.extract_frames(path, frames_output_dir)  
-            # key_frames, total_frames = service_utils.extract_key_frames(path, frames_output_dir, save_all_frames=True)
-            resp: service_utils.Response = self.frame_extractor.process(path, frames_output_dir)
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None)          
-            video_data = resp.result
+        with log_duration(f'Обработка видео {video_data.video_name}'):
+            video_data: service_utils.VideoData = service_utils.extract_frames(video_data)  
+            video_data: service_utils.VideoData = self.frame_extractor.process(video_data)
+        
         with log_duration("⏳Обработка"):
-            resp: service_utils.Response = self._audio_process(path, self.temp_dir, name)
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None) 
-            
-            resp: service_utils.Response = self._video_process(path, self.temp_dir, name, video_data)
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None) 
+            video_data: service_utils.VideoData = self._audio_process(video_data)
 
-        images_dir=os.path.join(self.temp_dir, name, 'frames_translated')
-        original_video_path = path
-        new_audio_path = os.path.join(self.temp_dir, name, f'{self.audio_translate_name}.mp3')
-        output_video_path=os.path.join(self.temp_dir, f'{name}.mp4')
+            video_data: service_utils.VideoData = self._video_process(video_data)
 
         with log_duration("⏳Постобработка"):
-            resp:service_utils.Response = service_utils.create_video_with_new_audio(    
-                images_dir=images_dir,
-                original_video_path=original_video_path,
-                new_audio_path=new_audio_path,
-                output_video_path=output_video_path
-            )
+            resp:service_utils.Response = service_utils.create_video_with_new_audio(video_data)
             if resp.status is False:
                 return service_utils.Response(False, resp.error, None) 
-        try:
-            shutil.rmtree(dir_path)
-            logger.info(f"✅Директория '{dir_path}' успешно удалена.")
-        except FileNotFoundError:
-            logger.info(f"❌Директория '{dir_path}' не найдена.")
-        except Exception as e:
-            logger.info(f"❌Ошибка при удалении директории: {e}")        
+            
+        # Удалим временные файлы и папки, если нужно
+        temp_directory = os.path.join(self.temp_dir, video_data.video_name)
+        service_utils.delete_temp_directory(temp_directory)
+            
         return service_utils.Response(True, None, None)
     
-    def _audio_process(self, path, temp_dir, name):
-        base_dir = os.path.join(temp_dir, name)
-        extract_audio_path = os.path.join(base_dir, f"{self.audio_extract_name}.mp3")
-        translated_wav = os.path.join(base_dir, f"{self.audio_translate_name}.wav")
-        translated_mp3 = os.path.join(base_dir, f"{self.audio_translate_name}.mp3")
-
+    def _audio_process(self, video_data: service_utils.VideoData):
         with log_duration("Recognizer.process"):
-            resp: service_utils.Response = self.recognizer.process(extract_audio_path)
-
-        if resp.status is False:
-            return service_utils.Response(False, resp.error, None)
-        transcript: str = resp.result.get("text", "")
-        path = os.path.join(temp_dir, name, f"audio_text_transcript.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(transcript)
+            video_data: service_utils.VideoData = self.recognizer.process(video_data)
             
         with log_duration("Translator.translate"):
-            resp: service_utils.Response = self.translator.translate([transcript])
-
-        if resp.status is False:
-            return service_utils.Response(False, resp.error, None)
-        
-        translation = resp.result['text'][0] # берем первый элемент, так как передавали список из одного текста
-        path = os.path.join(temp_dir, name, f"audio_text_translation.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(translation) # берем первый элемент, так как передавали список из одного текста
+            video_data: service_utils.VideoData = self.translator.process(video_data)
 
         with log_duration("TextToSpeech.synthesize"):
-            resp: service_utils.Response = self.generator.synthesize(translation, output_path=translated_wav)
-            
-        if resp.status is False:
-            return service_utils.Response(False, resp.error, None)
+            video_data: service_utils.VideoData = self.generator.process(video_data)
+ 
+        return video_data
 
-        with log_duration("wav_to_mp3"):
-            resp: service_utils.Response = service_utils.wav_to_mp3(translated_wav, translated_mp3)
-            
-        if resp.status is False:
-            return service_utils.Response(False, resp.error, None)
-        
-        return service_utils.Response(True, None, None)
-
-    def _video_process(self, path, temp_dir, name, video_data):
-        # key_frames = extra_info.get('key_frames', [])
-        # total_frames = extra_info.get('total_frames', 0)
-        frames = video_data.get('frames', [])
-        key_frames = video_data.get('key_frames', [])
-        total_frames = video_data.get('total_frames', 0)
-
-        frames_dir = os.path.join(temp_dir, name, 'frames')
-        # images = service_utils.get_image_paths(frames_dir)
-        output_dir = os.path.join(temp_dir, name, 'frames_translated')
-        ocr_out_path = os.path.join(temp_dir, name, f'ocr.json')
-
-        chosed_images = [img for idx, img in enumerate(frames) if idx in key_frames]
-
+    def _video_process(self, video_data: service_utils.VideoData) -> service_utils.VideoData:
         with log_duration(message="OCR"):
-            start = perf_counter()
-            logger.info(f"Processing {len(chosed_images)} key frames with OCR")
-            resp: service_utils.Response = self.ocr.process(chosed_images)
-            logger.info(f"OCR processing completed in {perf_counter() - start:.4f} seconds")
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None)
-            results = resp.result
+            video_data: service_utils.VideoData = self.ocr.process(video_data)
 
-            resp: service_utils.Response = self.ocr.save(results, ocr_out_path)
+        service_utils.save_video_data(video_data, 'var/video_data_example.pkl')
 
-            # TODO: удалить после тестов
-            # test_path = os.path.join('var/data/video', f"{self.ocr.model.name}_ocr_results.json")
-            # resp: service_utils.Response = self.ocr.save(results, test_path)
+        with log_duration('Translate - API call'):
+            video_data: service_utils.VideoData = self.translator.process(video_data)
 
-
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None)
-            
-        from tqdm import tqdm
-        with log_duration("Translate"):
-            results = service_utils.load_json(ocr_out_path)
-            # Получаем список текстов для перевода. создаем словарь индекс к кадру для последующего сопоставления перевода с кадром
-            index_dict = {}
-            texts_for_translation = []
-            global_index = 0
-            for id_result, result in enumerate(results):
-                index_dict[id_result] = []
-                for id_item, item in enumerate(result):
-                    item['translation'] = "" # добавляем поле для перевода, чтобы сохранить структуру данных и избежать проблем с сопоставлением после перевода
-                    index_dict[id_result].append(global_index)
-                    texts_for_translation.append(item['text'])
-                    global_index += 1
-            with log_duration('Translate - API call'):
-                resp: service_utils.Response = self.translator.translate(texts_for_translation)
-                translated_texts = resp.result
-                print(f"Translated {len(translated_texts)} texts")  # Debug print
-
-
-            for i, result in enumerate(
-                tqdm(results, desc="Translating OCR texts", unit="frame", ncols=100, colour="green"),
-                start=1,
-            ):
-                texts = [item['text'] for item in result]
-                resp: service_utils.Response = self.translator.translate(texts)
-                if isinstance(resp.result, dict) and 'text' in resp.result:
-                    for item, translate in zip(result, resp.result['text']):
-                        item['translation'] = translate
-            resp: service_utils.Response = service_utils.Response(True, None, results)
-            # resp: service_utils.Response = service_utils.translate_ocr_results(self.translator, results)
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None)
-            translated_data = resp.result
-            service_utils.save_json(translated_data, os.path.join(temp_dir, name, 'video_text.json'))
-
-        id_to_id = {k: i for i, k in enumerate(key_frames)}
-        results = []
-        indices_ext = key_frames + [total_frames]
-
-        results = [
-            k
-            for i, k in enumerate(key_frames)
-            for _ in range(indices_ext[i+1] - k)
-        ]
-
-        # imgs = [frames[id_result] for id_result in results]
-        
-        trans = [translated_data[id_to_id[id_result]] for id_result in results]
         with log_duration('Re translate'):
             resp: service_utils.Response = service_utils.translate_images(
-                frames,
-                trans,
-                output_dir=output_dir,
+                video_data=video_data,
+                output_dir=os.path.join(self.temp_dir, video_data.video_name),
                 font_path="arial.ttf"
             )
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None) 
 
-
-
-
-
-        # with log_duration('Re translate'):
-        #     resp: service_utils.Response = service_utils.translate_images(
-        #         chosed_images,
-        #         translated_data,
-        #         output_dir=output_dir,
-        #         font_path="arial.ttf"
-        #     )
-            if resp.status is False:
-                return service_utils.Response(False, resp.error, None) 
-        
-        return service_utils.Response(True, None, None)
+        return resp

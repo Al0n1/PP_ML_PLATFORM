@@ -98,6 +98,9 @@ python -m pip install "$PADDLEOCR_URL"
 echo "=== Установка основных зависимостей ==="
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python -m pip install -U qwen-tts
+python -m pip install -U flash-attn --no-build-isolation
+
 
 echo ""
 echo "=== Готово ==="

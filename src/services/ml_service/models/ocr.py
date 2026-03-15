@@ -1,12 +1,16 @@
 from typing import List, Union
 import numpy as np
 import cv2
+import logging
+import os
 from PIL import Image
 
-from ..utils import Response 
+from ..utils import VideoData, Response 
 from src.config.services.ml_config import settings, Settings
 from src.services.ml_service.models.ocrs.doctr import DOCTR 
 from src.services.ml_service.models.ocrs.ocr_paddle import PaddleOCRModel
+
+logger = logging.getLogger(__name__)
 
 
 MODELS = {'doctr': ['fast_base|||crnn_vgg16_bn'],
@@ -31,29 +35,11 @@ class OCR:
             return Response(False, result, None)
         return Response(True, None, None)
 
-    def process(self, images: List[Union[str, Image.Image, np.ndarray]]) -> Response:
+    def process(self, video_data: VideoData) -> VideoData:
         # Функция для распознавания текста на изображении. В данном случае она просто возвращает входные данные без изменений.
         # Имеется два варианта использования:
         # 1. Если передано только изображение, то будет распознан текст на нем.
         # 2. Если будет передан текст, то модель возьмет его как дополнительный контекст для распознавания.
         # Ограничения: если модель не использует текст, то второй вариант работать не будет.
-
-        """
-        result = [
-        {
-        'text': 'some text from image',
-        'bbox': [x1, y1, x2, y2], # нормализованные координаты ограничивающего прямоугольника текста на изображении
-        },
-        {
-        'text': 'some text from image',
-        'bbox': [x1, y1, x2, y2], 
-        }]
-        """
-
-        result = self.model.process(images)
-
-        if isinstance(result, str):  # если результат - строка, значит произошла ошибка
-            return Response(False, result, None)
-        
-        return Response(True, None, result)
+        return self.model.process(video_data)
 
